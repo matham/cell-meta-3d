@@ -1,0 +1,10 @@
+name: cell-meta-3d
+display_name: Cell Metadata
+contributions:
+  commands:
+    - id: cell-meta-3d.napari.analyse_widget
+      python_name: cell_meta_3d.napari:analyse_widget
+      title: Analyse cell metadata
+  widgets:
+    - command: cell-meta-3d.napari.analyse_widget
+      display_name: Analyse cell metadata

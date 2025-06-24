@@ -29,6 +29,9 @@ dependencies = [
     "magicgui",
     "qtpy",
     "scikit-image",
+    "brainglobe-utils",
+    "cellfinder",
+    "scipy",
 ]
 
 [project.optional-dependencies]
@@ -58,14 +61,13 @@ build-backend = "setuptools.build_meta"
 include-package-data = true
 
 [tool.setuptools.packages.find]
-where = ["src"]
 
 [tool.setuptools.package-data]
 "*" = ["*.yaml"]
 
 
 [tool.setuptools_scm]
-write_to = "src/cell_meta_3d/_version.py"
+write_to = "cell_meta_3d/_version.py"
 fallback_version = "0.0.1+nogit"
 
 
