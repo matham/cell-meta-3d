@@ -10,7 +10,7 @@ from brainglobe_utils.cells.cells import Cell
 from cellfinder.napari.utils import (
     add_single_layer,
 )
-from magicgui import magic_factory, magicgui
+from magicgui import magicgui
 from magicgui.widgets import FunctionGui, ProgressBar
 from napari.qt.threading import WorkerBase, WorkerBaseSignals
 from napari.utils.notifications import show_info
@@ -135,7 +135,7 @@ def add_heavy_widgets(
         # If False, magicgui passes these as args to root() when the root's
         # function runs. But that doesn't list them as args of its function
         widget.gui_only = True
-        root.insert(root.index(insertion) + 1, widget)
+        root.insert(root.index(insertion), widget)
         getattr(root, widget.name).label = new_name
 
 
@@ -172,7 +172,10 @@ def analyse_widget():
     }
     signal_image_opt, cell_layer_opt = get_heavy_widgets(options)
 
-    @magic_factory(
+    @magicgui(
+        voxel_size_z={"value": 5, "label": "Voxel size (z)"},
+        voxel_size_y={"value": 1, "label": "Voxel size (y)"},
+        voxel_size_x={"value": 1, "label": "Voxel size (x)"},
         call_button=True,
         persist=True,
         scrollable=False,

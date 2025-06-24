@@ -45,7 +45,7 @@ testing = [
 ]
 
 [project.entry-points."napari.manifest"]
-cell-meta-3d = "cell_meta_3d:napari.yaml"
+cell-meta-3d = "cell_meta_3d.napari:napari.yaml"
 
 [project.urls]
 "Bug Tracker" = "https://github.com/matham/cell-meta-3d/issues"
