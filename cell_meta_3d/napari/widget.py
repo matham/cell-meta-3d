@@ -1,20 +1,23 @@
 """ """
 
+import math
 from collections.abc import Callable
-from typing import Any
+from pathlib import Path
+from typing import Any, Literal
 
 import napari
 import napari.layers
-import numpy as np
 from brainglobe_utils.cells.cells import Cell
 from cellfinder.napari.utils import (
-    add_single_layer,
+    napari_array_to_cells,
 )
 from magicgui import magicgui
 from magicgui.widgets import FunctionGui, ProgressBar
 from napari.qt.threading import WorkerBase, WorkerBaseSignals
 from napari.utils.notifications import show_info
 from qtpy.QtCore import Signal
+
+from cell_meta_3d.main import main
 
 
 class MyWorkerSignals(WorkerBaseSignals):
@@ -36,13 +39,14 @@ class Worker(WorkerBase):
 
     def __init__(
         self,
-        voxel_size_z: float,
-        voxel_size_y: float,
-        voxel_size_x: float,
-        cells: np.ndarray,
+        signal_array: napari.layers.Image,
+        cells: list[Cell],
+        **main_args,
     ):
         super().__init__(SignalsClass=MyWorkerSignals)
+        self.signal_array = signal_array
         self.cells = cells
+        self.main_args = main_args
 
     def connect_progress_bar_callback(self, progress_bar: ProgressBar):
         """
@@ -58,17 +62,26 @@ class Worker(WorkerBase):
         self.update_progress_bar.connect(update_progress_bar)
 
     def work(self) -> list:
-        self.update_progress_bar.emit("Setting up...", 1, 0)
+        self.update_progress_bar.emit("Setting up...", len(self.cells), 0)
 
-        def update_callback(count: int) -> None:
+        def status_callback(count: int) -> None:
             self.update_progress_bar.emit(
                 "Analysing cells",
-                1,
-                count / len(self.cells),
+                len(self.cells),
+                count,
             )
 
-        self.update_progress_bar.emit("Finished analysis", 1, 1)
-        return []
+        cells = main(
+            signal_array=self.signal_array.data,
+            cells=self.cells,
+            status_callback=status_callback,
+            **self.main_args,
+        )
+
+        self.update_progress_bar.emit(
+            "Finished analysis", len(self.cells), len(self.cells)
+        )
+        return cells
 
 
 def get_heavy_widgets(
@@ -139,23 +152,6 @@ def add_heavy_widgets(
         getattr(root, widget.name).label = new_name
 
 
-def get_results_callback(viewer: napari.Viewer) -> Callable:
-    """
-    Returns the callback that is connected to output of the pipeline.
-    It returns the detected points that we have to visualize.
-    """
-
-    def done_func(points):
-        add_single_layer(
-            points,
-            viewer=viewer,
-            name="Analyzed cells",
-            cell_type=Cell.CELL,
-        )
-
-    return done_func
-
-
 def reraise(e: Exception) -> None:
     """Re-raises the exception."""
     raise Exception from e
@@ -173,29 +169,36 @@ def analyse_widget():
     signal_image_opt, cell_layer_opt = get_heavy_widgets(options)
 
     @magicgui(
-        voxel_size_z={"value": 5, "label": "Voxel size (z)"},
-        voxel_size_y={"value": 1, "label": "Voxel size (y)"},
-        voxel_size_x={"value": 1, "label": "Voxel size (x)"},
         call_button=True,
         persist=True,
-        scrollable=False,
     )
     def widget(
-        voxel_size_z: float,
-        voxel_size_y: float,
-        voxel_size_x: float,
+        voxel_size: tuple[float, float, float] = (5, 1, 1),
+        cube_size: tuple[float, float, float] = (100, 50, 50),
+        initial_center_search_size: tuple[float, float, float] = (10, 3, 3),
+        initial_center_search_volume: tuple[float, float, float] = (15, 3, 3),
+        lateral_intensity_algorithm: Literal[
+            "center_line", "area", "area_margin"
+        ] = "area_margin",
+        lateral_max_radius: float = 20,
+        lateral_decay_length: float = 12,
+        lateral_decay_fraction: float = 1 / math.e,
+        lateral_decay_algorithm: Literal["gaussian", "manual"] = "gaussian",
+        axial_intensity_algorithm: Literal[
+            "center_line", "area", "area_margin"
+        ] = "center_line",
+        axial_max_radius: float = 40,
+        axial_decay_length: float = 35,
+        axial_decay_fraction: float = 1 / math.e,
+        axial_decay_algorithm: Literal["gaussian", "manual"] = "gaussian",
+        batch_size: int = 1,
+        output_path: Path = None,
     ) -> None:
         """
         Run analysis.
 
         Parameters
         ----------
-        voxel_size_z : float
-            Size of your voxels in the axial dimension (microns)
-        voxel_size_y : float
-            Size of your voxels in the y direction (top to bottom) (microns)
-        voxel_size_x : float
-            Size of your voxels in the x direction (left to right) (microns)
         """
         # we must manually call so that the parameters of these functions are
         # initialized and updated. Because, if the images are open in napari
@@ -204,20 +207,32 @@ def analyse_widget():
         cell_layer_opt()
         signal_image = options["signal_image"]
         cell_layer = options["cell_layer"]
-        viewer = options["viewer"]
 
         if signal_image is None or cell_layer is None:
             show_info("Both signal image and cells must be provided.")
             return
 
         worker = Worker(
-            voxel_size_x=voxel_size_x,
-            voxel_size_y=voxel_size_y,
-            voxel_size_z=voxel_size_z,
-            cells=cell_layer.data,
+            signal_array=signal_image,
+            cells=napari_array_to_cells(cell_layer, Cell.CELL),
+            voxel_size=voxel_size,
+            cube_size=cube_size,
+            initial_center_search_size=initial_center_search_size,
+            initial_center_search_volume=initial_center_search_volume,
+            lateral_intensity_algorithm=lateral_intensity_algorithm,
+            lateral_max_radius=lateral_max_radius,
+            lateral_decay_length=lateral_decay_length,
+            lateral_decay_fraction=lateral_decay_fraction,
+            lateral_decay_algorithm=lateral_decay_algorithm,
+            axial_intensity_algorithm=axial_intensity_algorithm,
+            axial_max_radius=axial_max_radius,
+            axial_decay_length=axial_decay_length,
+            axial_decay_fraction=axial_decay_fraction,
+            axial_decay_algorithm=axial_decay_algorithm,
+            batch_size=batch_size,
+            output_path=output_path,
         )
 
-        worker.returned.connect(get_results_callback(viewer))
         # Make sure if the worker emits an error, it is propagated to this
         # thread
         worker.errored.connect(reraise)
@@ -228,8 +243,9 @@ def analyse_widget():
     add_heavy_widgets(
         widget,
         (signal_image_opt, cell_layer_opt),
-        ("Signal image", "Candidate cell layer"),
-        ("voxel_size_z", "voxel_size_z"),
+        ("Signal image", "Cell layer"),
+        ("voxel_size", "voxel_size"),
     )
+    widget.insert(widget.index("output_path") + 1, progress_bar)
 
     return widget
