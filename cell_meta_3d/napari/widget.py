@@ -140,7 +140,7 @@ def add_heavy_widgets(
     insertions: tuple[str, ...],
 ) -> None:
     for widget, new_name, insertion in zip(
-        widgets, new_names, insertions, strict=False
+        widgets, new_names, insertions, strict=True
     ):
         # make it look as if it's directly in the root container
         widget.margins = 0, 0, 0, 0
@@ -175,7 +175,7 @@ def analyse_widget():
     def widget(
         voxel_size: tuple[float, float, float] = (5, 1, 1),
         cube_size: tuple[float, float, float] = (100, 50, 50),
-        initial_center_search_size: tuple[float, float, float] = (10, 3, 3),
+        initial_center_search_radius: tuple[float, float, float] = (10, 3, 3),
         initial_center_search_volume: tuple[float, float, float] = (15, 3, 3),
         lateral_intensity_algorithm: Literal[
             "center_line", "area", "area_margin"
@@ -185,14 +185,14 @@ def analyse_widget():
         lateral_decay_fraction: float = 1 / math.e,
         lateral_decay_algorithm: Literal["gaussian", "manual"] = "gaussian",
         axial_intensity_algorithm: Literal[
-            "center_line", "area", "area_margin"
+            "center_line", "volume", "volume_margin"
         ] = "center_line",
         axial_max_radius: float = 40,
         axial_decay_length: float = 35,
         axial_decay_fraction: float = 1 / math.e,
         axial_decay_algorithm: Literal["gaussian", "manual"] = "gaussian",
-        batch_size: int = 1,
-        output_path: Path = None,
+        batch_size: int = 32,
+        output_cells_path: Path = None,
     ) -> None:
         """
         Run analysis.
@@ -217,7 +217,7 @@ def analyse_widget():
             cells=napari_array_to_cells(cell_layer, Cell.CELL),
             voxel_size=voxel_size,
             cube_size=cube_size,
-            initial_center_search_size=initial_center_search_size,
+            initial_center_search_radius=initial_center_search_radius,
             initial_center_search_volume=initial_center_search_volume,
             lateral_intensity_algorithm=lateral_intensity_algorithm,
             lateral_max_radius=lateral_max_radius,
@@ -230,7 +230,7 @@ def analyse_widget():
             axial_decay_fraction=axial_decay_fraction,
             axial_decay_algorithm=axial_decay_algorithm,
             batch_size=batch_size,
-            output_path=output_path,
+            output_cells_path=output_cells_path,
         )
 
         # Make sure if the worker emits an error, it is propagated to this
@@ -246,6 +246,6 @@ def analyse_widget():
         ("Signal image", "Cell layer"),
         ("voxel_size", "voxel_size"),
     )
-    widget.insert(widget.index("output_path") + 1, progress_bar)
+    widget.insert(widget.index("output_cells_path") + 1, progress_bar)
 
     return widget
