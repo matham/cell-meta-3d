@@ -59,7 +59,6 @@ class CellSizeCalc:
     axial_decay_fraction: float
 
     _center_search_data_indices: tuple[slice, slice, slice, slice]
-    _center_search_window: tuple[int, int, int, int]
     _center_search_offset: np.ndarray
 
     _circle_masks: np.ndarray
@@ -98,6 +97,7 @@ class CellSizeCalc:
     ):
         super().__init__(**kwargs)
         self.axial_dim = axial_dim
+        self.voxel_size = voxel_size
         self.lateral_intensity_algorithm = lateral_intensity_algorithm
         self.lateral_decay_algorithm = lateral_decay_algorithm
         self.lateral_decay_fraction = lateral_decay_fraction
@@ -140,7 +140,7 @@ class CellSizeCalc:
 
         self._calc_find_pos_center_window()
         self._make_circle_masks()
-        self._make_sphere_masks()
+        # self._make_sphere_masks()
 
     @property
     def lateral_dims(self) -> list[int]:
@@ -219,7 +219,6 @@ class CellSizeCalc:
 
     def _calc_find_pos_center_window(self) -> None:
         center_data_indices = [slice(None)]
-        center_search_window = [1]
         center_search_offset = []
 
         for dim, sides, win in zip(
@@ -229,20 +228,19 @@ class CellSizeCalc:
             strict=True,
         ):
             c = dim // 2
-            left_win = win // 2
-            right_win = win - left_win
+            half_win = win // 2
+            if not win % 2:
+                half_win -= 1
 
-            start = c - sides - left_win
-            end = c + sides + 1 + right_win
+            start = c - sides - half_win
+            end = c + sides + 1 + half_win
             center_data_indices.append(slice(start, end))
             if start < 0 or end >= dim:
                 raise ValueError
 
-            center_search_window.append(2 * sides + 1)
             center_search_offset.append(c - sides)
 
         self._center_search_data_indices = tuple(center_data_indices)
-        self._center_search_window = tuple(center_search_window)
         self._center_search_offset = np.array(
             [center_search_offset], dtype=np.int_
         )
@@ -254,12 +252,14 @@ class CellSizeCalc:
         n = len(data)
 
         data = data[self._center_search_data_indices]
-        windows = sliding_window_view(data, self._center_search_window)
+        windows = sliding_window_view(
+            data, self.initial_center_search_volume_voxels, axis=(1, 2, 3)
+        )
         intensity = np.sum(windows, axis=(4, 5, 6), dtype=np.float64)
 
         flat_max = intensity.reshape((n, -1)).argmax(axis=1)
         max_idx = np.column_stack(
-            np.unravel_index(flat_max, data[0, ...].shape)
+            np.unravel_index(flat_max, intensity.shape[1:])
         )
         assert len(max_idx) == n
 
@@ -356,7 +356,7 @@ class CellSizeCalc:
 
         out_line = np.zeros_like(line)
         max_val = line.max(axis=1, keepdims=True)
-        np.divide(line, max_val, out=out_line, where=max_val)
+        np.divide(line, max_val, out=out_line, where=max_val > 0)
 
         return out_line
 
@@ -433,9 +433,9 @@ class CellSizeCalc:
                 r_off_ax * 2 + 1,
                 max_r_lat + 1,
                 max_r_ax + 1,
+                max_r_ax * 2 + 1 + r_off_ax * 2,  # todo: order of axes
                 max_r_lat * 2 + 1 + r_off_lat * 2,
                 max_r_lat * 2 + 1 + r_off_lat * 2,
-                max_r_ax * 2 + 1 + r_off_ax * 2,
             )
         )
 
@@ -499,33 +499,31 @@ class CellSizeCalc:
 
         axial_axis = self.axial_dim
         lat_axes = [i for i in range(3) if i != axial_axis]
+        rel_center = center - self._center_search_offset
         # these are the center values for the 1st and 2nd lat axes
-        lat_c1 = center[:, lat_axes[0]]
-        lat_c2 = center[:, lat_axes[1]]
+        c1_rel = rel_center[:, lat_axes[0]]
+        c2_rel = rel_center[:, lat_axes[1]]
         ax_c = center[:, axial_axis]
 
         n = len(data)
         n_zeros = np.zeros(n, dtype=np.int_)
 
         # get axial center plane for each batch item
-        data_idx = _arr_index(4, [0, axial_axis], [np.arange(n), ax_c])
+        data_idx = _arr_index(4, [0, axial_axis + 1], [np.arange(n), ax_c])
         data = data[data_idx]
         # reduce planes to mask size, add final dim for radius dim
         data = data[
             :,
             c1 - max_r - r_off1 : c1 + max_r + r_off1 + 1,
             c2 - max_r - r_off2 : c2 + max_r + r_off2 + 1,
-            None,
         ]
 
         # select masks for the offset
-        c1_rel = lat_c1 - c1 + r_off1
-        c2_rel = lat_c2 - c2 + r_off2
         masks_idx = _arr_index(6, [0, 1, 2], [n_zeros, c1_rel, c2_rel])
         masks = self._circle_masks[masks_idx]
 
         masks_flat = np.reshape(masks, (n, max_r + 1, -1))
-        data_flat = np.reshape(data, (n, max_r + 1, -1))
+        data_flat = np.reshape(data, (n, -1))[:, None, :]
 
         intensity_sum = np.sum(
             masks_flat * data_flat, axis=2, dtype=np.float64
@@ -542,7 +540,7 @@ class CellSizeCalc:
 
         out_line = np.zeros_like(intensity)
         max_val = intensity.max(axis=1, keepdims=True)
-        np.divide(intensity, max_val, out=out_line, where=max_val)
+        np.divide(intensity, max_val, out=out_line, where=max_val > 0)
 
         return out_line
 

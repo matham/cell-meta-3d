@@ -1,3 +1,5 @@
+from typing import Union
+
 import numpy as np
 import torch
 from cellfinder.core.classify.cube_generator import (
@@ -17,7 +19,8 @@ class CellMeasureDatasetBase:
         self.cell_calc = cell_calc
 
     def convert_to_output(
-        self: CuboidDatasetBase | "CellMeasureDatasetBase", data: torch.Tensor
+        self: Union["CuboidDatasetBase", "CellMeasureDatasetBase"],
+        data: torch.Tensor,
     ) -> torch.Tensor:
         if self.data_voxel_sizes != self.network_voxel_sizes:
             raise ValueError
@@ -39,7 +42,9 @@ class CellMeasureDatasetBase:
             offsets[:, i] = np.round(r_data[:, 2]).astype(np.int_)
 
         idx = center + offsets
-        intensity = np_data[np.arange(len(np_data)), idx[0], idx[1], idx[2]]
+        intensity = np_data[
+            np.arange(len(np_data)), idx[:, 0], idx[:, 1], idx[:, 2]
+        ]
 
         output = np.concatenate(
             (
@@ -52,12 +57,13 @@ class CellMeasureDatasetBase:
             ),
             axis=1,
         )
+
         return torch.from_numpy(output).to(device=data.device)
 
 
-class CellMeasureStackDataset(CuboidStackDataset, CellMeasureDatasetBase):
+class CellMeasureStackDataset(CellMeasureDatasetBase, CuboidStackDataset):
     pass
 
 
-class CellMeasureTiffDataset(CuboidTiffDataset, CellMeasureDatasetBase):
+class CellMeasureTiffDataset(CellMeasureDatasetBase, CuboidTiffDataset):
     pass

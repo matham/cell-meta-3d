@@ -9,6 +9,7 @@ from brainglobe_utils.general.numerical import (
     check_positive_float,
     check_positive_int,
 )
+from brainglobe_utils.general.string import check_str
 
 from cell_meta_3d import __version__
 
@@ -152,6 +153,25 @@ def cell_meta_3d_parser() -> ArgumentParser:
         dest="batch_size",
         type=partial(check_positive_int, none_allowed=False),
         default=32,
+    )
+    parser.add_argument(
+        "--n-free-cpus",
+        dest="n_free_cpus",
+        type=partial(check_positive_int, none_allowed=False),
+        default=2,
+    )
+    parser.add_argument(
+        "--max-workers",
+        dest="max_workers",
+        type=partial(check_positive_int, none_allowed=False),
+        default=6,
+    )
+    parser.add_argument(
+        "-o-debug",
+        "--output-debug-path",
+        dest="output_debug_path",
+        type=check_str,
+        default=None,
     )
 
     return parser

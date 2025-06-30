@@ -6,6 +6,7 @@ from numbers import Number
 from pathlib import Path
 from typing import Literal
 
+import matplotlib.pyplot as plt
 import numpy as np
 import tqdm
 from brainglobe_utils.cells.cells import Cell
@@ -21,7 +22,7 @@ from cell_meta_3d.dataset import (
     CellMeasureStackDataset,
     CellMeasureTiffDataset,
 )
-from cell_meta_3d.measure import CellSizeCalc
+from cell_meta_3d.measure import CellSizeCalc, gaussian_func
 
 
 def main(
@@ -51,7 +52,7 @@ def main(
     axial_intensity_algorithm: Literal[
         "center_line", "volume", "volume_margin"
     ] = "center_line",
-    axial_max_radius: float = 40,
+    axial_max_radius: float = 35,
     axial_decay_length: float = 35,
     axial_decay_fraction: float = 1 / math.e,
     axial_decay_algorithm: Literal["gaussian", "manual"] = "gaussian",
@@ -59,6 +60,7 @@ def main(
     batch_size: int = 32,
     n_free_cpus: int = 2,
     max_workers: int = 6,
+    output_debug_path: Path | None = None,
     status_callback: Callable[[int], None] | None = None,
 ) -> list[Cell]:
     ts = datetime.now()
@@ -120,57 +122,162 @@ def main(
 
     workers = get_num_processes(min_free_cpu_cores=n_free_cpus)
     workers = min(workers, max_workers)
+    workers = min(workers, len(cells) // batch_size)
 
     data_loader = DataLoader(
         dataset=dataset,
-        batch_sampler=sampler,
+        sampler=sampler,
+        batch_size=None,
         num_workers=workers,
     )
 
     logging.info(f"cell_meta_3d: Starting analysis of {len(cells)} cells")
 
+    if output_debug_path:
+        output_debug_path.parent.mkdir(parents=True, exist_ok=True)
+
     output_cells = []
-    i = 0
+    count = 0
+    points = dataset.points
 
     if workers:
         dataset.start_dataset_thread(workers)
     try:
-        results = list(tqdm.tqdm(data_loader, unit="batch"))
+        for data, batch in tqdm.tqdm(zip(data_loader, sampler, strict=True)):
+            data = data.numpy()
+
+            splits = [
+                3,
+                4,
+                9,
+                14,
+                14 + cell_calc.lateral_max_radius_voxels + 1,
+            ]
+            center, intensity, r_lat_data, r_axial_data, lat_line, ax_line = (
+                np.split(data, splits, axis=1)
+            )
+            center = center.tolist()
+            intensity = intensity.tolist()
+            r_lat_data = r_lat_data.tolist()
+            r_axial_data = r_axial_data.tolist()
+
+            for i in batch:
+                cell = points[i]
+                z, y, x = center[i]
+                r_lat, a_lat, offset_lat, sigma_lat, c_lat = r_lat_data[i]
+                r_ax, a_ax, offset_ax, sigma_ax, c_ax = r_axial_data[i]
+
+                cell.z = z + int(round(offset_ax))
+                cell.y = y + int(round(offset_lat))
+                cell.x = x + int(round(offset_lat))
+
+                if not hasattr(cell, "metadata"):
+                    cell.metadata = {}
+                cell.metadata.update(
+                    {
+                        "r_z": int(round(r_ax)),
+                        "r_y": int(round(r_lat)),
+                        "r_x": int(round(r_lat)),
+                        "center_intensity": intensity[i],
+                    }
+                )
+
+                output_cells.append(cell)
+
+                if output_debug_path:
+                    _debug_display(
+                        cell,
+                        r_lat_data[i],
+                        r_axial_data[i],
+                        lat_line[i, :],
+                        ax_line[i, :],
+                        output_debug_path,
+                        cell_calc,
+                    )
+
+            count += len(batch)
+            if status_callback is not None:
+                status_callback(count)
     finally:
         dataset.stop_dataset_thread()
-
-    assert len(results) == len(sampler)
-    points = dataset.points
-    for data, batch in zip(results, sampler, strict=False):
-        data = data.numpy()
-
-        splits = [3, 4, 9, 14, 14 + cell_calc.lateral_decay_len_voxels]
-        center, intensity, r_lat_data, r_axial_data, lat_line, ax_line = (
-            np.split(data, splits)
-        )
-
-        for i in batch:
-            cell = points[i]
-            # z, y, x, r_z, r_y, r_x, intensity = item.tolist()
-            # cell.z = z
-            # cell.y = y
-            # cell.x = x
-            # cell.metadata = {
-            #     "r_z": r_z,
-            #     "r_y": r_y,
-            #     "r_x": r_x,
-            #     "center_intensity": intensity,
-            # }
-            output_cells.append(cell)
-
-        i += len(batch)
-        if status_callback is not None:
-            status_callback(i)
 
     save_cells(output_cells, str(output_cells_path))
     logging.info(f"cell_meta_3d: Analysis took {datetime.now() - ts}")
 
     return output_cells
+
+
+def _debug_display(
+    cell: Cell,
+    r_lat_data,
+    r_axial_data,
+    lat_line,
+    ax_line,
+    output_debug_path,
+    cell_calc,
+) -> None:
+    z, y, x = cell.z, cell.y, cell.x
+    vz, vy, vx = cell_calc.voxel_size
+    fig, (ax1, ax2) = plt.subplots(1, 2)
+
+    radii = np.arange(cell_calc.lateral_decay_len_voxels)
+    r = cell.metadata["r_y"]
+    val = 0
+    if 0 <= r < len(lat_line):
+        val = lat_line[r]
+
+    ax1.plot(np.arange(len(lat_line)) * vy, lat_line, "k--", label="Measured")
+    if cell_calc.lateral_decay_algorithm == "gaussian":
+        ax1.plot(
+            radii * vy,
+            gaussian_func(radii, *r_lat_data[1:]),
+            "m-.",
+            label="Modeled",
+        )
+    ax1.plot(
+        [r * vy],
+        [val],
+        "ro",
+        label=f"{100 * cell_calc.lateral_decay_fraction:0.2f}% threshold",
+    )
+    ax1.set_xlabel("Distance from point (microns)")
+    ax1.set_ylabel("Normalized intensity")
+    ax1.set_title("Lateral radius")
+    ax1.legend()
+
+    radii = np.arange(cell_calc.axial_decay_len_voxels)
+    r = cell.metadata["r_z"]
+    val = 0
+    if 0 <= r < len(ax_line):
+        val = ax_line[r]
+
+    ax2.plot(np.arange(len(ax_line)) * vz, ax_line, "k--", label="Measured")
+    if cell_calc.axial_decay_algorithm == "gaussian":
+        ax2.plot(
+            radii * vz,
+            gaussian_func(radii, *r_axial_data[1:]),
+            "m-.",
+            label="Modeled",
+        )
+    ax2.plot(
+        [r * vz],
+        [val],
+        "ro",
+        label=f"{100 * cell_calc.axial_decay_fraction:0.2f}% threshold",
+    )
+    ax2.set_xlabel("Distance from point (microns)")
+    ax2.set_ylabel("Normalized intensity")
+    ax2.set_title("Axial radius")
+    ax2.legend()
+
+    fig.tight_layout()
+
+    if output_debug_path:
+        name = f"radius_cell_z{z}y{y}x{x}.jpg"
+        fig.savefig(output_debug_path / name)
+        plt.close(fig)
+    else:
+        plt.show()
 
 
 def run_main():
@@ -200,6 +307,9 @@ def run_main():
         axial_decay_algorithm=args.axial_decay_algorithm,
         batch_size=args.batch_size,
         output_cells_path=output_cells,
+        n_free_cpus=args.n_free_cpus,
+        max_workers=args.max_workers,
+        output_debug_path=args.output_debug_path,
     )
 
 
