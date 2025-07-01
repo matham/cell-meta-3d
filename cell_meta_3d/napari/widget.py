@@ -7,8 +7,10 @@ from typing import Any, Literal
 
 import napari
 import napari.layers
+import numpy as np
 from brainglobe_utils.cells.cells import Cell
 from cellfinder.napari.utils import (
+    brainglobe_points_axis_order,
     napari_array_to_cells,
 )
 from magicgui import magicgui
@@ -169,10 +171,14 @@ def analyse_widget():
     signal_image_opt, cell_layer_opt = get_heavy_widgets(options)
 
     @magicgui(
+        lateral_decay_fraction={"max": 1, "step": 0.0001},
+        axial_decay_fraction={"max": 1, "step": 0.0001},
+        output_debug_path={"mode": "d"},
         call_button=True,
         persist=True,
     )
     def widget(
+        selected_cells_only: bool = False,
         voxel_size: tuple[float, float, float] = (5, 1, 1),
         cube_size: tuple[float, float, float] = (100, 50, 50),
         initial_center_search_radius: tuple[float, float, float] = (10, 3, 3),
@@ -191,8 +197,12 @@ def analyse_widget():
         axial_decay_length: float = 35,
         axial_decay_fraction: float = 1 / math.e,
         axial_decay_algorithm: Literal["gaussian", "manual"] = "gaussian",
-        batch_size: int = 32,
         output_cells_path: Path = None,
+        batch_size: int = 32,
+        n_free_cpus: int = 2,
+        max_workers: int = 3,
+        output_debug_path: Path | None = None,
+        save_plots: bool = False,
     ) -> None:
         """
         Run analysis.
@@ -212,9 +222,24 @@ def analyse_widget():
             show_info("Both signal image and cells must be provided.")
             return
 
+        if save_plots and not output_debug_path:
+            raise ValueError
+        if not save_plots:
+            output_debug_path = None
+
+        if selected_cells_only:
+            selection = np.asarray(list(cell_layer.selected_data))
+            data = np.asarray(cell_layer.data)[selection, :]
+            data = data[:, brainglobe_points_axis_order].tolist()
+            cells = []
+            for row in data:
+                cells.append(Cell(pos=row, cell_type=Cell.UNKNOWN))
+        else:
+            cells = napari_array_to_cells(cell_layer, Cell.CELL)
+
         worker = Worker(
             signal_array=signal_image,
-            cells=napari_array_to_cells(cell_layer, Cell.CELL),
+            cells=cells,
             voxel_size=voxel_size,
             cube_size=cube_size,
             initial_center_search_radius=initial_center_search_radius,
@@ -231,6 +256,9 @@ def analyse_widget():
             axial_decay_algorithm=axial_decay_algorithm,
             batch_size=batch_size,
             output_cells_path=output_cells_path,
+            n_free_cpus=n_free_cpus,
+            max_workers=max_workers,
+            output_debug_path=output_debug_path,
         )
 
         # Make sure if the worker emits an error, it is propagated to this
