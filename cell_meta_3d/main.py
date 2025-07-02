@@ -282,7 +282,7 @@ def main(
     batch_size: int = 32,
     n_free_cpus: int = 2,
     max_workers: int = 6,
-    output_debug_path: Path | None = None,
+    output_debug_path: Path | str | None = None,
     status_callback: Callable[[int], None] | None = None,
 ) -> list[Cell]:
     ts = datetime.now()
@@ -319,6 +319,7 @@ def main(
     )
 
     if output_debug_path:
+        output_debug_path = Path(output_debug_path)
         output_debug_path.parent.mkdir(parents=True, exist_ok=True)
 
     if workers:
