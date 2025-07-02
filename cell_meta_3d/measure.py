@@ -151,6 +151,8 @@ class CellSizeCalc:
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         if len(data.shape) != 4:
             raise ValueError
+        if data.shape[1:] != self.cube_voxels:
+            raise ValueError
         center = self.find_pos_center_max(data)
 
         match self.lateral_intensity_algorithm:
@@ -257,13 +259,24 @@ class CellSizeCalc:
         )
         intensity = np.sum(windows, axis=(4, 5, 6), dtype=np.float64)
 
-        flat_max = intensity.reshape((n, -1)).argmax(axis=1)
+        flat_intensity = intensity.reshape((n, -1))
+        all_same = np.all(
+            flat_intensity[:, 0][:, None] == flat_intensity, axis=1
+        )
+
+        flat_max = flat_intensity.argmax(axis=1)
         max_idx = np.column_stack(
             np.unravel_index(flat_max, intensity.shape[1:])
         )
         assert len(max_idx) == n
 
         max_idx += self._center_search_offset
+        max_idx = np.add(
+            max_idx,
+            [self.initial_center_search_radius_voxels],
+            out=max_idx,
+            where=all_same[:, None],
+        )
         return max_idx
 
     def get_center_2d_falloff_line(
