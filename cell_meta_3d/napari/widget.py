@@ -173,7 +173,7 @@ def analyse_widget():
     @magicgui(
         lateral_decay_fraction={"max": 1, "step": 0.0001},
         axial_decay_fraction={"max": 1, "step": 0.0001},
-        output_debug_path={"mode": "d"},
+        plot_output_path={"mode": "d"},
         call_button=True,
         persist=True,
     )
@@ -201,8 +201,9 @@ def analyse_widget():
         batch_size: int = 32,
         n_free_cpus: int = 2,
         max_workers: int = 3,
-        output_debug_path: Path | None = None,
+        plot_output_path: Path | None = None,
         save_plots: bool = False,
+        debug_data: bool = False,
     ) -> None:
         """
         Run analysis.
@@ -222,10 +223,10 @@ def analyse_widget():
             show_info("Both signal image and cells must be provided.")
             return
 
-        if save_plots and not output_debug_path:
+        if save_plots and not plot_output_path:
             raise ValueError
         if not save_plots:
-            output_debug_path = None
+            plot_output_path = None
 
         if selected_cells_only:
             selection = np.asarray(list(cell_layer.selected_data))
@@ -258,7 +259,8 @@ def analyse_widget():
             output_cells_path=output_cells_path,
             n_free_cpus=n_free_cpus,
             max_workers=max_workers,
-            output_debug_path=output_debug_path,
+            plot_output_path=plot_output_path,
+            debug_data=debug_data,
         )
 
         # Make sure if the worker emits an error, it is propagated to this

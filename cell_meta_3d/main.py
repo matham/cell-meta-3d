@@ -99,7 +99,7 @@ def _debug_display(
     r_axial_data,
     lat_line,
     ax_line,
-    output_debug_path,
+    plot_output_path,
     cell_calc,
 ) -> None:
     fig, (ax1, ax2) = plt.subplots(1, 2)
@@ -181,9 +181,9 @@ def _debug_display(
     fig.tight_layout()
     fig.subplots_adjust(bottom=0.22)
 
-    if output_debug_path:
+    if plot_output_path:
         name = f"radius_cell_z{z:05}y{y:05}x{x:05}.jpg"
-        fig.savefig(output_debug_path / name, dpi=300)
+        fig.savefig(plot_output_path / name, dpi=300)
         plt.close(fig)
     else:
         plt.show()
@@ -195,7 +195,8 @@ def _run_batches(
     sampler: CuboidBatchSampler,
     cell_calc: CellSizeCalc,
     points: list[Cell],
-    output_debug_path: Path | None,
+    plot_output_path: Path | None,
+    debug_data: bool,
     status_callback: Callable[[int], None] | None,
 ):
     output_cells = []
@@ -213,12 +214,21 @@ def _run_batches(
             3,
             4,
             9,
-            14,
-            14 + cell_calc.lateral_max_radius_voxels + 1,
+            13,
+            18,
+            22,
+            22 + cell_calc.lateral_max_radius_voxels + 1,
         ]
-        center, intensity, r_lat_data, r_axial_data, lat_line, ax_line = (
-            np.split(data, splits, axis=1)
-        )
+        (
+            center,
+            intensity,
+            r_lat_data,
+            lat_debug,
+            r_axial_data,
+            ax_debug,
+            lat_line,
+            ax_line,
+        ) = np.split(data, splits, axis=1)
         center = center.tolist()
         intensity = intensity.tolist()
         r_lat_data = r_lat_data.tolist()
@@ -244,17 +254,34 @@ def _run_batches(
                     "center_intensity": intensity[i],
                 }
             )
+            if debug_data:
+                cell.metadata["lateral_parameters"] = {
+                    "a": a_lat,
+                    "offset": offset_lat,
+                    "sigma": sigma_lat,
+                    "c": c_lat,
+                }
+                cell.metadata["lateral_parameters_std"] = lat_debug.tolist()
+                cell.metadata["lateral_line"] = lat_line.tolist()
+                cell.metadata["axial_parameters"] = {
+                    "a": a_ax,
+                    "offset": offset_ax,
+                    "sigma": sigma_ax,
+                    "c": c_ax,
+                }
+                cell.metadata["axial_parameters_std"] = ax_debug.tolist()
+                cell.metadata["axial_line"] = ax_line.tolist()
 
             output_cells.append(cell)
 
-            if output_debug_path:
+            if plot_output_path:
                 _debug_display(
                     cell,
                     r_lat_data[i],
                     r_axial_data[i],
                     lat_line[i, :],
                     ax_line[i, :],
-                    output_debug_path,
+                    plot_output_path,
                     cell_calc,
                 )
 
@@ -300,7 +327,8 @@ def main(
     batch_size: int = 32,
     n_free_cpus: int = 2,
     max_workers: int = 6,
-    output_debug_path: Path | str | None = None,
+    plot_output_path: Path | str | None = None,
+    debug_data: bool = False,
     status_callback: Callable[[int], None] | None = None,
 ) -> list[Cell]:
     ts = datetime.now()
@@ -336,9 +364,9 @@ def main(
         cell_calc,
     )
 
-    if output_debug_path:
-        output_debug_path = Path(output_debug_path)
-        output_debug_path.parent.mkdir(parents=True, exist_ok=True)
+    if plot_output_path:
+        plot_output_path = Path(plot_output_path)
+        plot_output_path.parent.mkdir(parents=True, exist_ok=True)
 
     if workers:
         dataset.start_dataset_thread(workers)
@@ -349,7 +377,8 @@ def main(
             sampler,
             cell_calc,
             dataset.points,
-            output_debug_path,
+            plot_output_path,
+            debug_data,
             status_callback,
         )
     finally:
@@ -390,7 +419,8 @@ def run_main():
         output_cells_path=output_cells,
         n_free_cpus=args.n_free_cpus,
         max_workers=args.max_workers,
-        output_debug_path=args.output_debug_path,
+        plot_output_path=args.plot_output_path,
+        debug_data=args.debug_data,
     )
 
 

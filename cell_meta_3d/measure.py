@@ -198,15 +198,16 @@ class CellSizeCalc:
         fraction: float,
         len_voxels: int,
     ) -> np.ndarray:
-        output = np.zeros((len(line), 5))
+        output = np.zeros((len(line), 9))
         match algorithm:
             case "gaussian":
                 for i, item in enumerate(line):
-                    output[i, :] = self.get_radius_from_gaussian(
+                    r, params, err = self.get_radius_from_gaussian(
                         item,
                         fraction,
                         len_voxels,
                     )
+                    output[i, :] = r, *params, *err
             case "manual":
                 r = self.get_radius_from_decay(
                     line,
@@ -562,7 +563,7 @@ class CellSizeCalc:
         data: np.ndarray,
         decay_fraction: float,
         max_n: int,
-    ) -> tuple[float, float, float, float, float]:
+    ) -> tuple[float, list[float], list[float]]:
         data = data[:max_n]
         n = len(data)
         bounds = (
@@ -571,21 +572,22 @@ class CellSizeCalc:
         )
 
         try:
-            (a, offset, sigma, c), _ = curve_fit(
+            (a, offset, sigma, c), pcov = curve_fit(
                 gaussian_func,
                 np.arange(n),
                 data,
                 p0=[1, 0, 0.5 * (max_n - 1), 0],
                 bounds=bounds,
             )
+            perr = np.sqrt(np.diag(pcov))
         except (RuntimeError, ValueError):
-            return -1, 0, 0, 0, 0
+            return -1, [0, 0, 0, 0], [0, 0, 0, 0]
 
         desired_val = c + decay_fraction * a
         r = math.sqrt(-2 * sigma**2 * math.log((desired_val - c) / a))
 
         # r is relative to "offset" from center
-        return r, a, offset, sigma, c
+        return r, [a, offset, sigma, c], perr.tolist()
 
     def get_radius_from_decay(
         self,

@@ -168,10 +168,15 @@ def cell_meta_3d_parser() -> ArgumentParser:
     )
     parser.add_argument(
         "-o-debug",
-        "--output-debug-path",
-        dest="output_debug_path",
+        "--plot-output-path",
+        dest="plot_output_path",
         type=check_str,
         default=None,
+    )
+    parser.add_argument(
+        "--debug-data",
+        dest="debug_data",
+        action="store_true",
     )
 
     return parser
