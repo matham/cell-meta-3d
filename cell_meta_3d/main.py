@@ -261,16 +261,16 @@ def _run_batches(
                     "sigma": sigma_lat,
                     "c": c_lat,
                 }
-                cell.metadata["lateral_parameters_std"] = lat_debug.tolist()
-                cell.metadata["lateral_line"] = lat_line.tolist()
+                cell.metadata["lateral_parameters_std"] = lat_debug[i].tolist()
+                cell.metadata["lateral_line"] = lat_line[i].tolist()
                 cell.metadata["axial_parameters"] = {
                     "a": a_ax,
                     "offset": offset_ax,
                     "sigma": sigma_ax,
                     "c": c_ax,
                 }
-                cell.metadata["axial_parameters_std"] = ax_debug.tolist()
-                cell.metadata["axial_line"] = ax_line.tolist()
+                cell.metadata["axial_parameters_std"] = ax_debug[i].tolist()
+                cell.metadata["axial_line"] = ax_line[i].tolist()
 
             output_cells.append(cell)
 
