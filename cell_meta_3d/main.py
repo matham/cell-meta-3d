@@ -141,7 +141,8 @@ def _debug_display(
 
     ax1.set_xlabel("Distance from point (microns)")
     ax1.set_ylabel("Normalized intensity")
-    ax1.set_title(f"Lateral radius {func}")
+    std = int(cell.metadata["r_y_std"])
+    ax1.set_title(f"Lateral radius (std={std}){func}")
 
     ax2.plot(np.arange(len(ax_line)) * vz, ax_line, "k--")
 
@@ -175,7 +176,8 @@ def _debug_display(
 
     ax2.set_xlabel("Distance from point (microns)")
     ax2.set_ylabel("Normalized intensity")
-    ax2.set_title(f"Axial radius{func}")
+    std = int(cell.metadata["r_z_std"])
+    ax2.set_title(f"Axial radius (std={std}){func}")
 
     fig.legend(loc="lower center", ncols=3)
     fig.tight_layout()
@@ -246,12 +248,16 @@ def _run_batches(
 
             if not hasattr(cell, "metadata"):
                 cell.metadata = {}
+            r_lat_std = lat_debug[i].max().item()
             cell.metadata.update(
                 {
                     "r_z": int(round(r_ax)),
                     "r_y": int(round(r_lat)),
                     "r_x": int(round(r_lat)),
                     "center_intensity": intensity[i],
+                    "r_z_std": ax_debug[i].max().item(),
+                    "r_y_std": r_lat_std,
+                    "r_x_std": r_lat_std,
                 }
             )
             if debug_data:
