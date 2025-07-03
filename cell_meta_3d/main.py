@@ -107,69 +107,83 @@ def _debug_display(
     z, y, x = cell.z, cell.y, cell.x
     vz, vy, vx = cell_calc.voxel_size
 
-    radii = np.arange(cell_calc.lateral_decay_len_voxels)
-    r = cell.metadata["r_y"]
-    val = 0
-    if 0 <= r < len(lat_line):
-        val = lat_line[r]
-
     ax1.plot(np.arange(len(lat_line)) * vy, lat_line, "k--", label="Measured")
+
     func = ""
+    model_label = "Modeled"
     if cell_calc.lateral_decay_algorithm == "gaussian":
+        n = cell_calc.lateral_decay_len_voxels
+        radii = np.linspace(-n / 4, n, 200)
         ax1.plot(
             radii * vy,
             gaussian_func(radii, *r_lat_data[1:]),
-            "m-.",
-            label="Modeled",
+            "g-.",
+            label=model_label,
         )
+        model_label = None
 
         a, off, sig, c = r_lat_data[1:]
-        func = f"\n${a:0.2f}*e^{{-\\frac{{(r-{off:0.2f})^{{2}}}}{{2*{sig:0.2f}^{{2}}}}}}+{c:0.2f}$"
+        func = (
+            f"\n${a:0.2f}*e^{{-\\frac{{(\\frac{{r}}{{{vy:0.2f}}}-"
+            f"{off:0.2f})^{{2}}}}{{2*{sig:0.2f}^{{2}}}}}}+{c:0.2f}$"
+        )
+
+    p_hor = int(round(cell.metadata["r_y"] + r_lat_data[2]))
+    val = 0
+    if 0 <= p_hor < len(lat_line):
+        val = lat_line[p_hor]
     ax1.plot(
-        [r * vy],
+        [p_hor * vy],
         [val],
         "ro",
         label=f"{100 * cell_calc.lateral_decay_fraction:0.2f}% threshold",
     )
+
     ax1.set_xlabel("Distance from point (microns)")
     ax1.set_ylabel("Normalized intensity")
     ax1.set_title(f"Lateral radius {func}")
-    ax1.legend()
 
-    radii = np.arange(cell_calc.axial_decay_len_voxels)
-    r = cell.metadata["r_z"]
-    val = 0
-    if 0 <= r < len(ax_line):
-        val = ax_line[r]
+    ax2.plot(np.arange(len(ax_line)) * vz, ax_line, "k--")
 
-    ax2.plot(np.arange(len(ax_line)) * vz, ax_line, "k--", label="Measured")
     func = ""
     if cell_calc.axial_decay_algorithm == "gaussian":
+        n = cell_calc.axial_decay_len_voxels
+        radii = np.linspace(-n / 4, n, 200)
         ax2.plot(
             radii * vz,
             gaussian_func(radii, *r_axial_data[1:]),
-            "m-.",
-            label="Modeled",
+            "g-.",
+            label=model_label,
         )
 
         a, off, sig, c = r_axial_data[1:]
-        func = f"\n${a:0.2f}*e^{{-\\frac{{(r-{off:0.2f})^{{2}}}}{{2*{sig:0.2f}^{{2}}}}}}+{c:0.2f}$"
+        func = (
+            f"\n${a:0.2f}*e^{{-\\frac{{(\\frac{{r}}{{{vz:0.2f}}}-"
+            f"{off:0.2f})^{{2}}}}{{2*{sig:0.2f}^{{2}}}}}}+{c:0.2f}$"
+        )
+
+    p_hor = int(round(cell.metadata["r_z"] + r_axial_data[2]))
+    val = 0
+    if 0 <= p_hor < len(ax_line):
+        val = ax_line[p_hor]
     ax2.plot(
-        [r * vz],
+        [p_hor * vz],
         [val],
-        "ro",
+        "mo",
         label=f"{100 * cell_calc.axial_decay_fraction:0.2f}% threshold",
     )
+
     ax2.set_xlabel("Distance from point (microns)")
     ax2.set_ylabel("Normalized intensity")
     ax2.set_title(f"Axial radius{func}")
-    ax2.legend()
 
+    fig.legend(loc="lower center", ncols=3)
     fig.tight_layout()
+    fig.subplots_adjust(bottom=0.22)
 
     if output_debug_path:
         name = f"radius_cell_z{z:05}y{y:05}x{x:05}.jpg"
-        fig.savefig(output_debug_path / name)
+        fig.savefig(output_debug_path / name, dpi=300)
         plt.close(fig)
     else:
         plt.show()
@@ -177,6 +191,7 @@ def _debug_display(
 
 def _run_batches(
     data_loader: DataLoader,
+    dataset: CellMeasureTiffDataset | CellMeasureStackDataset,
     sampler: CuboidBatchSampler,
     cell_calc: CellSizeCalc,
     points: list[Cell],
@@ -185,6 +200,9 @@ def _run_batches(
 ):
     output_cells = []
     count = 0
+    z_center = dataset.get_cuboid_center("z", cell_calc.cube_voxels[0])
+    y_center = dataset.get_cuboid_center("y", cell_calc.cube_voxels[1])
+    x_center = dataset.get_cuboid_center("x", cell_calc.cube_voxels[2])
 
     for data, batch in tqdm.tqdm(
         zip(data_loader, sampler, strict=True), total=len(sampler)
@@ -208,13 +226,13 @@ def _run_batches(
 
         for i, point_i in enumerate(batch):
             cell = points[point_i]
-            z, y, x = center[i]
+            z, y, x = map(int, center[i])
             r_lat, a_lat, offset_lat, sigma_lat, c_lat = r_lat_data[i]
             r_ax, a_ax, offset_ax, sigma_ax, c_ax = r_axial_data[i]
 
-            cell.z = z + int(round(offset_ax))
-            cell.y = y + int(round(offset_lat))
-            cell.x = x + int(round(offset_lat))
+            cell.z += z - z_center
+            cell.y += y - y_center
+            cell.x += x - x_center
 
             if not hasattr(cell, "metadata"):
                 cell.metadata = {}
@@ -327,6 +345,7 @@ def main(
     try:
         output_cells = _run_batches(
             data_loader,
+            dataset,
             sampler,
             cell_calc,
             dataset.points,

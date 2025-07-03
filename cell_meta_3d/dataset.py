@@ -6,6 +6,7 @@ from cellfinder.core.classify.cube_generator import (
     CuboidDatasetBase,
     CuboidStackDataset,
     CuboidTiffDataset,
+    get_data_cuboid_range,
 )
 
 from cell_meta_3d.measure import CellSizeCalc
@@ -35,13 +36,15 @@ class CellMeasureDatasetBase:
         center, r_lat_data, r_axial_data, lat_line, ax_line = cell_calc(
             np_data
         )
+        idx = center
 
-        offsets = np.zeros_like(center)
-        for i in range(3):
-            r_data = r_axial_data if i == cell_calc.axial_dim else r_lat_data
-            offsets[:, i] = np.round(r_data[:, 2]).astype(np.int_)
+        # we don't know the direction of offset for now
+        # offsets = np.zeros_like(center)
+        # for i in range(3):
+        #     r_data = r_axial_data if i == cell_calc.axial_dim else r_lat_data
+        #     offsets[:, i] = np.round(r_data[:, 2]).astype(np.int_)
+        # idx = center + offsets
 
-        idx = center + offsets
         intensity = np_data[
             np.arange(len(np_data)), idx[:, 0], idx[:, 1], idx[:, 2]
         ]
@@ -59,6 +62,10 @@ class CellMeasureDatasetBase:
         )
 
         return torch.from_numpy(output).to(device=data.device)
+
+    def get_cuboid_center(self, axis: str, size: int) -> int:
+        start, _ = get_data_cuboid_range(0, size, axis)
+        return abs(start)
 
 
 class CellMeasureStackDataset(CellMeasureDatasetBase, CuboidStackDataset):
