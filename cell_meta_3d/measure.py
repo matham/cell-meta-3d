@@ -58,7 +58,7 @@ class CellSizeCalc:
     axial_decay_len_voxels: int
     axial_decay_fraction: float
 
-    _center_search_data_indices: tuple[slice, slice, slice, slice]
+    _center_search_data_indices: tuple[slice, slice, slice, slice] | None
     _center_search_offset: np.ndarray
 
     _circle_masks: np.ndarray
@@ -224,6 +224,13 @@ class CellSizeCalc:
         center_data_indices = [slice(None)]
         center_search_offset = []
 
+        if not any(self.initial_center_search_radius_voxels):
+            self._center_search_data_indices = None
+            self._center_search_offset = np.array(
+                [v // 2 for v in self.cube_voxels], dtype=np.int_
+            )
+            return
+
         for dim, sides, win in zip(
             self.cube_voxels,
             self.initial_center_search_radius_voxels,
@@ -253,6 +260,9 @@ class CellSizeCalc:
         data: np.ndarray,
     ) -> np.ndarray:
         n = len(data)
+        if self._center_search_data_indices is None:
+            max_idx = self._center_search_offset[None, ...]
+            return np.repeat(max_idx, n, axis=0)
 
         data = data[self._center_search_data_indices]
         windows = sliding_window_view(
@@ -272,6 +282,7 @@ class CellSizeCalc:
         assert len(max_idx) == n
 
         max_idx += self._center_search_offset
+        # set it back to center if they were all the same
         max_idx = np.add(
             max_idx,
             [self.initial_center_search_radius_voxels],

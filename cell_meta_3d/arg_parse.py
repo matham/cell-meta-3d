@@ -125,7 +125,7 @@ def cell_meta_3d_parser() -> ArgumentParser:
         "--axial-max-radius",
         dest="axial_max_radius",
         type=partial(check_positive_float, none_allowed=False),
-        default=40,
+        default=35,
     )
     parser.add_argument(
         "-ax-len",
