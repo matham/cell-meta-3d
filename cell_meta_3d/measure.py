@@ -574,12 +574,20 @@ class CellSizeCalc:
         data: np.ndarray,
         decay_fraction: float,
         max_n: int,
+        left_max_offset: float = -0.25,
+        right_max_offset: float = 3,
+        min_scale: float = 0.1,
+        max_scale: float = 1.25,
+        min_sigma: float = 0.1,
+        max_sigma: float = 10.0,
+        min_y_offset: float = -1,
+        max_y_offset: float = 1,
     ) -> tuple[float, list[float], list[float]]:
         data = data[:max_n]
         n = len(data)
         bounds = (
-            [0.1, -3, 0.1, -1],
-            [1.25, 3, 10, 1],
+            [min_scale, left_max_offset, min_sigma, min_y_offset],
+            [max_scale, right_max_offset, max_sigma, max_y_offset],
         )
 
         try:
