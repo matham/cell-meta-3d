@@ -149,6 +149,13 @@ def cell_meta_3d_parser() -> ArgumentParser:
         default="gaussian",
     )
     parser.add_argument(
+        "--decay-gaussian-bounds",
+        dest="decay_gaussian_bounds",
+        nargs=8,
+        type=float,
+        default=[0.1, 1, -0.25, 3, 0.1, 10.0, -1, 1],
+    )
+    parser.add_argument(
         "--batch-size",
         dest="batch_size",
         type=partial(check_positive_int, none_allowed=False),

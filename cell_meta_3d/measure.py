@@ -1,6 +1,6 @@
 import math
-from collections.abc import Sequence
-from numbers import Number
+from collections.abc import Callable, Sequence
+from multiprocessing import shared_memory
 from typing import Literal
 
 import numpy as np
@@ -9,11 +9,11 @@ from scipy.optimize import curve_fit
 
 
 def _expand_num_triplet(
-    value: Number | tuple[Number, Number, Number],
-) -> tuple[Number, Number, Number]:
-    if isinstance(value, Number):
+    value: float | tuple[float, float, float],
+) -> tuple[float, float, float]:
+    if not isinstance(value, Sequence):
         return value, value, value
-    return value
+    return tuple(value)
 
 
 def _arr_index(n: int, indices: Sequence[int], values: Sequence) -> tuple:
@@ -28,11 +28,24 @@ def _arr_index(n: int, indices: Sequence[int], values: Sequence) -> tuple:
 def _norm_by_size(
     value: tuple[float, float, float], size: tuple[float, float, float]
 ) -> tuple[int, int, int]:
-    return tuple(int(round(v / s)) for v, s in zip(value, size, strict=True))
+    normed = (
+        int(round(value[0] / size[0])),
+        int(round(value[1] / size[1])),
+        int(round(value[2] / size[2])),
+    )
+    return normed
 
 
 def gaussian_func(x, a, offset, sigma, c):
     return a * np.exp(-np.square(x - offset) / (2 * sigma**2)) + c
+
+
+_gauss_names = ["a", "offset", "sigma", "c"]
+_gauss_names += [f"{name}_std" for name in _gauss_names]
+
+
+def default_center(ax: int, size: int) -> int:
+    return int(round(size / 2))
 
 
 class CellSizeCalc:
@@ -42,10 +55,38 @@ class CellSizeCalc:
     cube_voxels: tuple[int, int, int]
 
     initial_center_search_radius_voxels: tuple[int, int, int]
+    """The radius around the center, in each dim, along which to search for
+    a higher central intensity. If we find a better intensity (using the volume
+    initial_center_search_volume_voxels around that point), we use that as the
+    new cell center.
+
+    The radius is in addition to the center. E.g. if the radius is `2`, then
+    we'll consider for a total of 5 center points: the center, and 2 voxels on
+    each side of the original center.
+
+    Unit is in voxels.
+    """
     initial_center_search_volume_voxels: tuple[int, int, int]
+    """The volume size to use when searching for the best center. We compute
+    the overall intensity of a volume of this size, around a potential cell
+    center. A value of zero, means just use the center voxel. Otherwise, it's
+    centered on the center voxel. E.g. a value of 1 would be the center voxel
+    plus a voxel on one side.
+
+    Unit is in voxels.
+    """
 
     lateral_intensity_algorithm: Literal["center_line", "area", "area_margin"]
     lateral_max_radius_voxels: int
+    """From the (adjusted) center of the cell, we get the axial plane located
+    at that center. Then, from the lateral center, we extract the 4 lines
+    within the plane that start from the center and extend radially outward.
+    These 4 lines are in each direction for the 2 lateral axes.
+
+    `lateral_max_radius_voxels` indicates how many voxels (not including the
+    center) to use to extend that line in any direction. The average of the 4
+    lines is then used to estimate the intensity drop-off from the center.
+    """
     lateral_decay_algorithm: Literal["gaussian", "manual"]
     lateral_decay_len_voxels: int
     lateral_decay_fraction: float
@@ -58,23 +99,46 @@ class CellSizeCalc:
     axial_decay_len_voxels: int
     axial_decay_fraction: float
 
-    _center_search_data_indices: tuple[slice, slice, slice, slice] | None
-    _center_search_offset: np.ndarray
+    decay_gaussian_bounds: Sequence[float]
 
-    _circle_masks: np.ndarray
+    # the center of the cube
+    cube_center_voxels: np.ndarray
+
+    # 4d tuple of slices, indicating the sub-volume of the cube we need, in
+    # order to search for a better cell center. For each dim (first is
+    # slice(None) for batch dim) it's the slice to extract the volume of that
+    # dim
+    _center_search_data_indices: tuple[slice, slice, slice, slice] | None
+    # the index in the cube of the first (start) voxel we consider as new
+    # center for each of the 3d. E.g. if the original center is 10, and we
+    # search a radius of 2 on each side, this would be 8 for that dim. It's
+    # cube_center_voxels if there's no shifts. It has an extra first dim
+    _center_search_start: np.ndarray
+
+    # the np masks buffer that helps us calc circles of different sizes, at
+    # different offsets from the original cube center
+    _circle_masks: np.ndarray | None = None
+    # The underlying _circle_masks buffer is a shared memory so it can be
+    # shared across multiple processes without each needed a full copy
+    _circle_masks_buffer: shared_memory.SharedMemory | None = None
+    # only in the main process that created the buffer is this true
+    _circle_masks_buffer_created: bool = False
     _sphere_masks: np.ndarray
+
+    _gauss_dtype = np.dtype([(name, np.float64) for name in _gauss_names])
 
     def __init__(
         self,
         axial_dim: int = 0,
         voxel_size: tuple[float, float, float] = (5, 1, 1),
-        cube_size: float | tuple[float, float, float] = (100, 50, 50),
-        initial_center_search_radius: float | tuple[float, float, float] = (
+        cube_size_um: float | tuple[float, float, float] = (100, 50, 50),
+        cuboid_center_func: Callable[[int, int], int] = default_center,
+        initial_center_search_radius_um: float | tuple[float, float, float] = (
             10,
             3,
             3,
         ),
-        initial_center_search_volume: float | tuple[float, float, float] = (
+        initial_center_search_volume_um: float | tuple[float, float, float] = (
             15,
             3,
             3,
@@ -82,17 +146,27 @@ class CellSizeCalc:
         lateral_intensity_algorithm: Literal[
             "center_line", "area", "area_margin"
         ] = "area_margin",
-        lateral_max_radius: float = 20,
-        lateral_decay_length: float = 12,
+        lateral_max_radius_um: float = 20,
+        lateral_decay_length_um: float = 12,
         lateral_decay_fraction: float = 1 / math.e,
         lateral_decay_algorithm: Literal["gaussian", "manual"] = "gaussian",
         axial_intensity_algorithm: Literal[
             "center_line", "volume", "volume_margin"
         ] = "center_line",
-        axial_max_radius: float = 40,
-        axial_decay_length: float = 35,
+        axial_max_radius_um: float = 35,
+        axial_decay_length_um: float = 35,
         axial_decay_fraction: float = 1 / math.e,
         axial_decay_algorithm: Literal["gaussian", "manual"] = "gaussian",
+        decay_gaussian_bounds: Sequence[float] = (
+            0.1,
+            1.25,
+            -0.25,
+            3,
+            0.1,
+            10.0,
+            -1,
+            1,
+        ),
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -105,21 +179,21 @@ class CellSizeCalc:
         self.axial_decay_algorithm = axial_decay_algorithm
         self.axial_decay_fraction = axial_decay_fraction
 
-        cube_size = _expand_num_triplet(cube_size)
-        self.cube_voxels = _norm_by_size(cube_size, voxel_size)
+        cube_size_um = _expand_num_triplet(cube_size_um)
+        self.cube_voxels = _norm_by_size(cube_size_um, voxel_size)
 
-        initial_center_search_radius = _expand_num_triplet(
-            initial_center_search_radius
+        initial_center_search_radius_um = _expand_num_triplet(
+            initial_center_search_radius_um
         )
         self.initial_center_search_radius_voxels = _norm_by_size(
-            initial_center_search_radius, voxel_size
+            initial_center_search_radius_um, voxel_size
         )
 
-        initial_center_search_volume = _expand_num_triplet(
-            initial_center_search_volume
+        initial_center_search_volume_um = _expand_num_triplet(
+            initial_center_search_volume_um
         )
         self.initial_center_search_volume_voxels = _norm_by_size(
-            initial_center_search_volume, voxel_size
+            initial_center_search_volume_um, voxel_size
         )
 
         lat_voxels = [r for i, r in enumerate(voxel_size) if i != axial_dim]
@@ -127,34 +201,146 @@ class CellSizeCalc:
         axial_vox = voxel_size[axial_dim]
 
         self.lateral_max_radius_voxels = int(
-            round(lateral_max_radius / lat_vox)
+            round(lateral_max_radius_um / lat_vox)
         )
         self.lateral_decay_len_voxels = int(
-            round(lateral_decay_length / lat_vox)
+            round(lateral_decay_length_um / lat_vox)
         )
 
-        self.axial_max_radius_voxels = int(round(axial_max_radius / axial_vox))
-        self.axial_decay_len_voxels = int(
-            round(axial_decay_length / axial_vox)
+        self.axial_max_radius_voxels = int(
+            round(axial_max_radius_um / axial_vox)
         )
+        self.axial_decay_len_voxels = int(
+            round(axial_decay_length_um / axial_vox)
+        )
+
+        self.cube_center_voxels = np.array(
+            [cuboid_center_func(i, v) for i, v in enumerate(self.cube_voxels)],
+            dtype=np.int_,
+        )
+
+        self.decay_gaussian_bounds = decay_gaussian_bounds
+
+        self._verify_lateral_parameters()
+        self._verify_axial_parameters()
 
         self._calc_find_pos_center_window()
-        self._make_circle_masks()
-        # self._make_sphere_masks()
+        if self.lateral_intensity_algorithm.startswith("area"):
+            self._make_circle_masks()
+
+        if self.axial_intensity_algorithm.startswith("volume"):
+            self._make_sphere_masks()
+
+    def __del__(self):
+        # we have to close the ref to the shared memory
+        if self._circle_masks_buffer is not None:
+            # every instance must close the ref
+            self._circle_masks_buffer.close()
+            if self._circle_masks_buffer_created:
+                # in the main process that created it, we must also fully
+                # delete it. Presumably, when this instance is deleted, all
+                # the sub-processes are already closed, otherwise if they try
+                # to access the memory it may crash
+                self._circle_masks_buffer.unlink()
+            self._circle_masks_buffer = None
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+
+        # when copying the instance to create a new one, use underlying shared
+        # mem for masks
+        state["_circle_masks_buffer_created"] = False
+        if state["_circle_masks_buffer"] is not None:
+            # we need the name of the buffer and its shape for __setstate__
+            state["_circle_masks_buffer"] = state["_circle_masks_buffer"].name
+        if state["_circle_masks"] is not None:
+            state["_circle_masks"] = state["_circle_masks"].shape
+        return state
+
+    def __setstate__(self, state):
+        if state["_circle_masks_buffer"] is not None:
+            # see __getstate__. We share the underlying memory
+            shm = shared_memory.SharedMemory(
+                name=state["_circle_masks_buffer"],
+                create=False,
+                track=False,
+            )
+            state["_circle_masks_buffer"] = shm
+
+        if (
+            state["_circle_masks"] is not None
+            and state["_circle_masks_buffer"] is not None
+        ):
+            masks = np.ndarray(
+                state["_circle_masks"],
+                dtype=np.bool,
+                buffer=state["_circle_masks_buffer"].buf,
+            )
+            state["_circle_masks"] = masks
+        else:
+            state["_circle_masks"] = None
+
+        self.__dict__.update(state)
 
     @property
     def lateral_dims(self) -> list[int]:
+        """Returns the dim indices of the data, that are lateral dimensions."""
         return [i for i in range(3) if i != self.axial_dim]
 
-    def __call__(
-        self, data: np.ndarray
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    def _parameters_names(
+        self, algorithm: Literal["gaussian", "manual"]
+    ) -> list[str]:
+        match algorithm:
+            case "gaussian":
+                return _gauss_names
+            case "manual":
+                return []
+            case _:
+                raise ValueError
+
+    @property
+    def lateral_parameters_names(self):
+        return self._parameters_names(self.lateral_decay_algorithm)
+
+    @property
+    def axial_parameters_names(self):
+        return self._parameters_names(self.lateral_decay_algorithm)
+
+    @property
+    def lateral_line_length(self):
+        return self.lateral_max_radius_voxels + 1
+
+    @property
+    def axial_line_length(self):
+        return self.axial_max_radius_voxels + 1
+
+    def __call__(self, data: np.ndarray) -> tuple[
+        np.ndarray,
+        np.ndarray,
+        np.ndarray,
+        np.ndarray | None,
+        np.ndarray,
+        np.ndarray,
+        np.ndarray | None,
+    ]:
+        """
+        Ideally, we would shift the center by the amount estimate during
+        radius estimation (e.g. with Gaussian), but currently we don't know
+        the direction of the shift.
+
+        :param data: Shape is 4D: batch, and the 3 data dims in the same order
+            as the input parameters (e.g. `voxel_size`).
+        :return:
+        """
         if len(data.shape) != 4:
+            # batch dim is first
             raise ValueError
         if data.shape[1:] != self.cube_voxels:
             raise ValueError
+        # get the 3d indices of the (better) cube centers
         center = self.find_pos_center_max(data)
 
+        # get the intensity decay line from the center in the lateral direction
         match self.lateral_intensity_algorithm:
             case "center_line":
                 lat_line = self.get_center_2d_falloff_line(data, center)
@@ -165,13 +351,15 @@ class CellSizeCalc:
             case _:
                 raise ValueError
 
-        r_lat_data = self._get_decay_radius(
+        # calculate the lateral radius based on the decay
+        r_lat, r_lat_params = self._get_decay_radius(
             lat_line,
             self.lateral_decay_algorithm,
             self.lateral_decay_fraction,
-            self.lateral_decay_len_voxels,
+            self.lateral_decay_len_voxels + 1,
         )
 
+        # get the intensity decay line from the center in the axial direction
         match self.axial_intensity_algorithm:
             case "center_line":
                 ax_line = self.get_center_1d_falloff_line(data, center)
@@ -182,14 +370,23 @@ class CellSizeCalc:
             case _:
                 raise ValueError
 
-        r_axial_data = self._get_decay_radius(
+        # calculate the axial radius based on the decay
+        r_axial, r_axial_params = self._get_decay_radius(
             ax_line,
             self.axial_decay_algorithm,
             self.axial_decay_fraction,
-            self.axial_decay_len_voxels,
+            self.axial_decay_len_voxels + 1,
         )
 
-        return center, r_lat_data, r_axial_data, lat_line, ax_line
+        return (
+            center,
+            r_lat,
+            lat_line,
+            r_lat_params,
+            r_axial,
+            ax_line,
+            r_axial_params,
+        )
 
     def _get_decay_radius(
         self,
@@ -197,61 +394,94 @@ class CellSizeCalc:
         algorithm: Literal["gaussian", "manual"],
         fraction: float,
         len_voxels: int,
-    ) -> np.ndarray:
-        output = np.zeros((len(line), 9))
+    ) -> tuple[np.ndarray, np.ndarray | None]:
+        params_arr = None
+        r_arr = np.empty(len(line), dtype=np.float64)
+
         match algorithm:
             case "gaussian":
-                for i, item in enumerate(line):
+                params_arr = np.empty(len(line), dtype=self._gauss_dtype)
+
+                for i in range(len(line)):
                     r, params, err = self.get_radius_from_gaussian(
-                        item,
+                        line[i, :],
                         fraction,
                         len_voxels,
+                        *self.decay_gaussian_bounds,
                     )
-                    output[i, :] = r, *params, *err
+                    r_arr[i] = r
+                    params_arr[_gauss_names][i] = *params, *err
             case "manual":
                 r = self.get_radius_from_decay(
                     line,
                     fraction,
                     len_voxels,
                 )
-                output[:, 0] = r
+                r_arr[:] = r
             case _:
                 raise ValueError
 
-        return output
+        return r_arr, params_arr
 
     def _calc_find_pos_center_window(self) -> None:
+        """Pre-calculates the sub-regions of the cuboid we need in order to
+        search for a new and better center.
+        """
         center_data_indices = [slice(None)]
         center_search_offset = []
 
+        # only pre-calc if we adjust the cube center in at least one direction
         if not any(self.initial_center_search_radius_voxels):
             self._center_search_data_indices = None
-            self._center_search_offset = np.array(
-                [v // 2 for v in self.cube_voxels], dtype=np.int_
-            )
+            # no shift
+            self._center_search_start = self.cube_center_voxels[None, :]
             return
 
-        for dim, sides, win in zip(
+        for c, dim, sides, win in zip(
+            self.cube_center_voxels,
             self.cube_voxels,
             self.initial_center_search_radius_voxels,
             self.initial_center_search_volume_voxels,
             strict=True,
         ):
-            c = dim // 2
-            half_win = win // 2
-            if not win % 2:
-                half_win -= 1
+            # we search sides voxels on each side, not including the original c
+            if not sides:
+                start = end = c
+            else:
+                start = c - sides
+                end = c + sides + 1
 
-            start = c - sides - half_win
-            end = c + sides + 1 + half_win
+            # win of zero means just use center voxel
+            if win < 0:
+                raise ValueError(
+                    f"Requested a center search volume width of {win} voxels. "
+                    f"We need at least a window of 0 voxels"
+                )
+            # split window into (unequal) halves (if not even)
+            half_win = win // 2
+            rest_win = win - half_win
+
+            # we have to add to start that many voxels, not including start
+            start -= half_win
+            # the center is inclusive so adding rest_win, we have window size
+            # of win + 1. We need +1 because win of zero means just the center
+            end += rest_win
+
             center_data_indices.append(slice(start, end))
-            if start < 0 or end >= dim:
-                raise ValueError
+            if start < 0 or end > dim:
+                raise ValueError(
+                    f"The cube size of {dim} voxels is too small for a center "
+                    f"adjustment search of {sides} voxels on each side, with a"
+                    f" volume window size of {win} voxels. For a cube center "
+                    f"of {c} voxels, we would have needed a sub-region of "
+                    f"[{start}, {end}) with size {end - start} voxels, which "
+                    f"extends beyond the full cube"
+                )
 
             center_search_offset.append(c - sides)
 
         self._center_search_data_indices = tuple(center_data_indices)
-        self._center_search_offset = np.array(
+        self._center_search_start = np.array(
             [center_search_offset], dtype=np.int_
         )
 
@@ -259,29 +489,54 @@ class CellSizeCalc:
         self,
         data: np.ndarray,
     ) -> np.ndarray:
+        """
+        Searches the cube for a better center of the cell, by looking around
+        the center for a brighter area and picking its center voxel.
+
+        :param data: A 4D array of batch X 3 dimensions with the cube
+            intensity values.
+        :return: A 2D array of Nx3 containing the index to the new
+            center of the cell in the cube. The original center is
+            `cube_center_voxels`. If we don't find a better center, it stays
+            the same.
+        """
         n = len(data)
+
         if self._center_search_data_indices is None:
-            max_idx = self._center_search_offset[None, ...]
+            # no search - the center is the original center. Just add batch dim
+            max_idx = self.cube_center_voxels[None, ...]
             return np.repeat(max_idx, n, axis=0)
 
+        # extract the padded 3d sub-region to search
         data = data[self._center_search_data_indices]
-        windows = sliding_window_view(
-            data, self.initial_center_search_volume_voxels, axis=(1, 2, 3)
-        )
+        # create a bunch of 3d sliding windows across the 3 data dims. For each
+        # voxel in the data (not including the padding, only in the search
+        # radius) we generate a volume of the asked size. So we end up with 7D.
+        # The 1st dim is batch, 2nd - 4th the search area (e.g. if the search r
+        # for a dim is 1, the size of that dim is 3), 5th - 7th is the win_size
+        # We add one to window, because zero means just the center voxel etc.
+        win_size = [v + 1 for v in self.initial_center_search_volume_voxels]
+        windows = sliding_window_view(data, win_size, axis=(1, 2, 3))
+        # for each voxel in the search are, add up the total intensity of the
+        # volume around that voxel. Back to 4D of the search area size
         intensity = np.sum(windows, axis=(4, 5, 6), dtype=np.float64)
 
+        # flatten the search area so we can search more easily
         flat_intensity = intensity.reshape((n, -1))
+        # check if all intensities are the same for a given cube
         all_same = np.all(
             flat_intensity[:, 0][:, None] == flat_intensity, axis=1
         )
 
         flat_max = flat_intensity.argmax(axis=1)
+        # convert back to 2D indices, with 2nd dim the max index of each cube
         max_idx = np.column_stack(
             np.unravel_index(flat_max, intensity.shape[1:])
         )
         assert len(max_idx) == n
 
-        max_idx += self._center_search_offset
+        # the indices of the max is relative to the start of the search area
+        max_idx += self._center_search_start
         # set it back to center if they were all the same
         max_idx = np.add(
             max_idx,
@@ -291,14 +546,105 @@ class CellSizeCalc:
         )
         return max_idx
 
+    def _verify_lateral_parameters(self):
+        center_offsets = [
+            self.initial_center_search_radius_voxels[i]
+            for i in self.lateral_dims
+        ]
+        center = self.cube_center_voxels
+        sizes = [self.cube_voxels[i] for i in self.lateral_dims]
+        r = self.lateral_max_radius_voxels
+        decay = self.lateral_decay_len_voxels
+
+        if decay > r:
+            raise ValueError(
+                f"Requested fit of line with size {decay} voxels. This is "
+                f"larger than the size of the requested lateral line of {r}"
+                f" voxels"
+            )
+
+        for c, c_offset, size in zip(
+            center, center_offsets, sizes, strict=False
+        ):
+            # number of elements inclusive of the center
+            right = size - (c + c_offset)
+            # same - number of elements inclusive of the center
+            left = c - c_offset + 1
+
+            # don't need to check for decay because decay <= r
+            # number of elements is center plus r
+            if right + r >= size:
+                raise ValueError(
+                    f"Requested lateral line with size {r} voxels and "
+                    f"potential center offset of {c_offset} voxels. This is "
+                    f"larger than the size of the cube {size} voxels"
+                )
+            if left - r < 0:
+                raise ValueError(
+                    f"Requested lateral line with size {r} voxels and "
+                    f"potential center offset of negative {c_offset} voxels. "
+                    f"This is larger than the size of the cube {size} voxels"
+                )
+
+    def _verify_axial_parameters(self):
+        c_offset = self.initial_center_search_radius_voxels[self.axial_dim]
+        c = self.cube_center_voxels[self.axial_dim]
+        size = self.cube_voxels[self.axial_dim]
+        r = self.axial_max_radius_voxels
+        decay = self.axial_decay_len_voxels
+
+        if decay > r:
+            raise ValueError(
+                f"Requested fit of line with size {decay} voxels. This is "
+                f"larger than the size of the requested axial line of {r}"
+                f" voxels"
+            )
+
+        # number of elements inclusive of the center
+        right = size - (c + c_offset)
+        # same - number of elements inclusive of the center
+        left = c - c_offset + 1
+
+        # don't need to check for decay because decay <= r
+        # number of elements is center plus r
+        if right + r >= size:
+            raise ValueError(
+                f"Requested axial line with size {r} voxels and "
+                f"potential center offset of {c_offset} voxels. This is "
+                f"larger than the size of the cube {size} voxels"
+            )
+        if left - r < 0:
+            raise ValueError(
+                f"Requested axial line with size {r} voxels and "
+                f"potential center offset of negative {c_offset} voxels. "
+                f"This is larger than the size of the cube {size} voxels"
+            )
+
     def get_center_2d_falloff_line(
         self,
         data: np.ndarray,
         center: np.ndarray,
     ) -> np.ndarray:
+        """
+        Uses the 4 lateral lines emanating from the center, in the center axial
+        plane, to calculate the average intensity line starting from the
+        center.
+
+        :param data: A 4D array of batch X 3 dimensions with the cube
+            intensity values.
+        :param center: A 2D array of Nx3 containing the index to the
+            center of the cell in the cube.
+        :return: A 2D array of NxK. Where K is `lateral_max_radius_voxels` + 1.
+            And for each cube contains the average lateral intensity starting
+            from the center going outward.
+
+            The line for each batch item is normalized to be in the [0, 1]
+            range.
+        """
         axial_axis = self.axial_dim
-        n_points = self.lateral_max_radius_voxels
-        lat_axes = [i for i in range(3) if i != axial_axis]
+        # zero means just the center etc.
+        n_points = self.lateral_max_radius_voxels + 1
+        lat_axes = self.lateral_dims
         n = len(data)
         n_range = np.arange(n)
 
@@ -309,21 +655,29 @@ class CellSizeCalc:
         lat_c1 = center[:, lat_axes[0]]
         lat_c2 = center[:, lat_axes[1]]
 
-        # data is 4-d with first axis batch. Use centers to index the axial dim
+        # data is 4D with first axis batch. Use centers to index the axial dim
         # to get the center plane for each batch item. We end up with 3-d array
         planes = data[
             _arr_index(4, [0, axial_axis + 1], [n_range, axial_center])
         ]
+        # from the Nx3 planes, for the first lat axis, index the 2D array of
+        # that axis at its center. This will return a line along the 2nd lat
+        # axis at the center of the 1st lat axis. Same for the 2nd axis
         ax2_line = planes[_arr_index(3, [0, 1], [n_range, lat_c1])]
         ax1_line = planes[_arr_index(3, [0, 2], [n_range, lat_c2])]
 
+        # For the line along the 2nd lat axis, get the subsection of the line
+        # that starts at the center of that (2nd) axis and goes out by desired
+        # radius from there
         line1 = ax2_line[
             n_range[:, None], lat_c2[:, None] + np.arange(n_points)[None, :]
         ]
+        # similarly we do for the opposite direction of the line
         line2 = ax2_line[
             n_range[:, None],
             lat_c2[:, None] + np.arange(0, -n_points, -1)[None, :],
         ]
+        # and the same for the first lat axis
         line3 = ax1_line[
             n_range[:, None], lat_c1[:, None] + np.arange(n_points)[None, :]
         ]
@@ -338,7 +692,7 @@ class CellSizeCalc:
 
         out_line = np.zeros_like(line)
         max_val = line.max(axis=1, keepdims=True)
-        np.divide(line, max_val, out=out_line, where=max_val)
+        np.divide(line, max_val, out=out_line, where=max_val > 0)
 
         return out_line
 
@@ -347,9 +701,26 @@ class CellSizeCalc:
         data: np.ndarray,
         center: np.ndarray,
     ) -> np.ndarray:
+        """
+        Uses the 2 lateral lines emanating from the center along the axial
+        direction to calculate the average intensity line starting from the
+        center.
+
+        :param data: A 4D array of batch X 3 dimensions with the cube
+            intensity values.
+        :param center: A 2D array of Nx3 containing the index to the
+            center of the cell in the cube.
+        :return: A 2D array of NxK. Where K is `axial_max_radius_voxels` + 1.
+            And for each cube contains the average axial intensity starting
+            from the center going outward.
+
+            The line for each batch item is normalized to be in the [0, 1]
+            range.
+        """
         axial_axis = self.axial_dim
-        n_points = self.axial_max_radius_voxels
-        lat_axes = [i for i in range(3) if i != axial_axis]
+        # zero means just the center etc.
+        n_points = self.axial_max_radius_voxels + 1
+        lat_axes = self.lateral_dims
         n = len(data)
         n_range = np.arange(n)
 
@@ -364,8 +735,11 @@ class CellSizeCalc:
         # 2nd lateral dims to get the center axial line for each batch item
         planes = data[_arr_index(4, [0, lat_axes[0] + 1], [n_range, lat_c1])]
         # lat axes are ordered so 2nd axis is going to be shifted down by one
+        # so no need to add 1 for batch dim
         lines = planes[_arr_index(3, [0, lat_axes[1]], [n_range, lat_c2])]
 
+        # from the lateral center line, locate the axial center and get the
+        # line from there on each direction
         line1 = lines[
             n_range[:, None],
             axial_center[:, None] + np.arange(n_points)[None, :],
@@ -388,30 +762,40 @@ class CellSizeCalc:
     def _make_circle_masks(
         self,
     ) -> None:
-        axial_axis = self.axial_dim
+        """
+        Generates the masks we use in get_area_falloff_line to quickly
+        calculate the intensity over a circle with possible offset from
+        center.
+        """
+        # _verify_lateral_parameters ensures we have enough cube size
         max_r = self.lateral_max_radius_voxels
-        r_off = self.initial_center_search_radius_voxels
-        r_off1, r_off2 = [v for i, v in enumerate(r_off) if i != axial_axis]
-        cube = self.cube_voxels
-        dim1, dim2 = [c for i, c in enumerate(cube) if i != axial_axis]
-        c1, c2 = dim1 // 2, dim2 // 2
+        r_off1, r_off2 = [
+            self.initial_center_search_radius_voxels[i]
+            for i in self.lateral_dims
+        ]
 
-        if c1 - max_r - r_off1 < 0 or c1 + max_r + r_off1 >= dim1:
-            raise ValueError
-        if c2 - max_r - r_off2 < 0 or c2 + max_r + r_off2 >= dim2:
-            raise ValueError
-
-        # dims are batch, c1, c2, dim1, dim2, mask_r
-        masks = np.zeros(
-            (
-                1,
-                r_off1 * 2 + 1,
-                r_off2 * 2 + 1,
-                max_r + 1,
-                max_r * 2 + 1 + r_off1 * 2,
-                max_r * 2 + 1 + r_off2 * 2,
-            )
+        # dims are batch, c1, c2, mask_r, dim1, dim2
+        masks_shape = (
+            1,
+            r_off1 * 2 + 1,
+            r_off2 * 2 + 1,
+            max_r + 1,
+            max_r * 2 + 1 + r_off1 * 2,
+            max_r * 2 + 1 + r_off2 * 2,
         )
+
+        # create a shared memory numpy array, that is shared with sub-processes
+        single_bytes = np.zeros(1, dtype=np.bool).nbytes
+        total_bytes = math.prod(masks_shape) * single_bytes
+        shm = shared_memory.SharedMemory(
+            create=True, size=total_bytes, track=False
+        )
+
+        masks = np.ndarray(masks_shape, dtype=np.bool, buffer=shm.buf)
+        masks[...] = 0
+
+        # grid the plane with the largest coordinates we can have. Both max_r
+        # and offsets are in addition to the center
         dist1 = np.arange(-max_r - r_off1, max_r + r_off1 + 1)[:, None]
         dist2 = np.arange(-max_r - r_off2, max_r + r_off2 + 1)[None, :]
 
@@ -423,6 +807,8 @@ class CellSizeCalc:
                     )
                     masks[0, off1 + r_off1, off2 + r_off2, r, :, :] = dist <= r
 
+        self._circle_masks_buffer = shm
+        self._circle_masks_buffer_created = True
         self._circle_masks = masks
 
     def _make_sphere_masks(
@@ -470,7 +856,7 @@ class CellSizeCalc:
         dist2 = np.arange(-max_r_lat - r_off_lat, max_r_lat + r_off_lat + 1)[
             None, :
         ]
-        plane_dims = [i for i in range(3) if i != axial_axis]
+        plane_dims = self.lateral_dims
         dist3 = np.expand_dims(
             np.abs(np.arange(-max_r_ax - r_off_ax, max_r_ax + r_off_ax + 1)),
             plane_dims,
@@ -514,17 +900,32 @@ class CellSizeCalc:
         center: np.ndarray,
         margin: bool,
     ) -> np.ndarray:
-        axial_axis = self.axial_dim
+        """
+
+
+        :param data: A 4D array of batch X 3 dimensions with the cube
+            intensity values.
+        :param center: A 2D array of Nx3 containing the index to the
+            center of the cell in the cube.
+        :param margin:
+        :return: A 2D array of NxK. Where K is `lateral_max_radius_voxels` + 1.
+            And for each cube contains the average lateral intensity of a
+            circle with given radius starting from the center going outward.
+
+            The line for each batch item is normalized to be in the [0, 1]
+            range.
+        """
         max_r = self.lateral_max_radius_voxels
-        r_off = self.initial_center_search_radius_voxels
-        r_off1, r_off2 = [v for i, v in enumerate(r_off) if i != axial_axis]
-        cube = self.cube_voxels
-        dim1, dim2 = [c for i, c in enumerate(cube) if i != axial_axis]
-        c1, c2 = dim1 // 2, dim2 // 2
+        r_off1, r_off2 = [
+            self.initial_center_search_radius_voxels[i]
+            for i in self.lateral_dims
+        ]
+        c1, c2 = [self.cube_center_voxels[i] for i in self.lateral_dims]
 
         axial_axis = self.axial_dim
-        lat_axes = [i for i in range(3) if i != axial_axis]
-        rel_center = center - self._center_search_offset
+        lat_axes = self.lateral_dims
+        # get the offset relative to most negative smallest center offset
+        rel_center = center - self._center_search_start
         # these are the center values for the 1st and 2nd lat axes
         c1_rel = rel_center[:, lat_axes[0]]
         c2_rel = rel_center[:, lat_axes[1]]
@@ -533,30 +934,38 @@ class CellSizeCalc:
         n = len(data)
         n_zeros = np.zeros(n, dtype=np.int_)
 
-        # get axial center plane for each batch item
+        # get axial center plane for each batch item to end up with 3D data
         data_idx = _arr_index(4, [0, axial_axis + 1], [np.arange(n), ax_c])
         data = data[data_idx]
-        # reduce planes to mask size, add final dim for radius dim
+        # extract mask size area in the center of planes
         data = data[
             :,
             c1 - max_r - r_off1 : c1 + max_r + r_off1 + 1,
             c2 - max_r - r_off2 : c2 + max_r + r_off2 + 1,
         ]
-
-        # select masks for the offset
+        # select masks matching the correct center offset
         masks_idx = _arr_index(6, [0, 1, 2], [n_zeros, c1_rel, c2_rel])
+        # masks will ow be 4D: batch, mask_r, dim1, dim2
         masks = self._circle_masks[masks_idx]
 
+        # flatten dim1 and dim2 so we only have 3D: batch, mask_r, dim
         masks_flat = np.reshape(masks, (n, max_r + 1, -1))
         data_flat = np.reshape(data, (n, -1))[:, None, :]
 
+        # calculate the masked intensity over the mask as well as the mask size
+        # this gives us a 2D array of NxR
         intensity_sum = np.sum(
             masks_flat * data_flat, axis=2, dtype=np.float64
         )
         mask_size = np.sum(masks_flat, axis=2, dtype=np.float64)
 
+        # average intensity of the mask
         intensity = intensity_sum / mask_size
+        # if we want to calculate the intensity of the pixels in the current
+        # circle that was not in the last circle, do it
         if margin:
+            # only set for R larger than the first (0). For the first it's just
+            # the original value
             intensity[:, 1:] = (
                 intensity_sum[:, 1:] - intensity_sum[:, :-1]
             ) / (mask_size[:, 1:] - mask_size[:, :-1])
@@ -574,10 +983,10 @@ class CellSizeCalc:
         data: np.ndarray,
         decay_fraction: float,
         max_n: int,
-        left_max_offset: float = -0.25,
-        right_max_offset: float = 3,
         min_scale: float = 0.1,
         max_scale: float = 1.25,
+        left_max_offset: float = -0.25,
+        right_max_offset: float = 3,
         min_sigma: float = 0.1,
         max_sigma: float = 10.0,
         min_y_offset: float = -1,

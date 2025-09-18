@@ -2,21 +2,28 @@ import logging
 import math
 from collections.abc import Callable, Sequence
 from datetime import datetime
+from functools import wraps
 from numbers import Number
 from pathlib import Path
-from typing import Literal
+from typing import Literal, ParamSpec, TypeVar
 
 import matplotlib.pyplot as plt
 import numpy as np
+import torch
 import tqdm
 from brainglobe_utils.cells.cells import Cell
 from brainglobe_utils.general.system import get_num_processes
 from brainglobe_utils.IO.cells import get_cells, save_cells
 from brainglobe_utils.IO.image.load import read_z_stack
 from cellfinder.core import types
-from cellfinder.core.classify.cube_generator import CuboidBatchSampler
+from cellfinder.core.classify.cube_generator import (
+    CuboidBatchSampler,
+    get_data_cuboid_range,
+)
+from fancylog import fancylog
 from torch.utils.data import DataLoader
 
+import cell_meta_3d
 from cell_meta_3d.arg_parse import cell_meta_3d_parser
 from cell_meta_3d.dataset import (
     CellMeasureStackDataset,
@@ -24,13 +31,70 @@ from cell_meta_3d.dataset import (
 )
 from cell_meta_3d.measure import CellSizeCalc, gaussian_func
 
+T = TypeVar("T")
+P = ParamSpec("P")
+
+
+def _set_torch_threads(worker: int):
+    torch.set_num_threads(4)
+
+
+def _set_torch_threads_dec(f: Callable[P, T]) -> Callable[P, T]:
+    @wraps(f)
+    def inner(*args: P.args, **kwargs: P.kwargs) -> T:
+        threads = torch.get_num_threads()
+        _set_torch_threads(0)
+        try:
+            return f(*args, **kwargs)
+        finally:
+            torch.set_num_threads(threads)
+
+    return inner
+
+
+def get_cuboid_center(axis: str, size: int) -> int:
+    # use a point at zero, this will give us the start of the cube relative
+    # to zero. Then, abs of that will be the distance from start to center
+    start, _ = get_data_cuboid_range(0, size, axis)
+    return abs(start)
+
+
+def _get_cuboid_center_by_index(ax: int, size: int) -> int:
+    # z, y, x
+    match ax:
+        case 0:
+            return get_cuboid_center("z", size)
+        case 1:
+            return get_cuboid_center("y", size)
+        case 2:
+            return get_cuboid_center("x", size)
+        case _:
+            raise ValueError
+
+
+def _interpolate(
+    values: np.ndarray, index: float, default_value: float
+) -> float | np.ndarray:
+    index = float(index)
+
+    if index < 0 or index > len(values) - 1:
+        return default_value
+
+    if index.is_integer():
+        return values[int(index)].item()
+
+    lower_i = int(index)
+    ratio = values[lower_i + 1] - values[lower_i]
+    value = ratio * (index - lower_i) + values[lower_i]
+    return value
+
 
 def _get_dataset(
     cells: list[Cell],
     points_filenames: Sequence[str] | None,
     signal_array: types.array | None,
     voxel_size: tuple[float, float, float],
-    cube_size: float | tuple[float, float, float],
+    cube_voxels: tuple[int, int, int],
     batch_size: int,
     n_free_cpus: int,
     max_workers: int,
@@ -41,11 +105,6 @@ def _get_dataset(
     CuboidBatchSampler,
     int,
 ]:
-    if isinstance(cube_size, Number):
-        cube_size = cube_size, cube_size, cube_size
-    cube_voxels = tuple(
-        int(round(c / v)) for c, v in zip(cube_size, voxel_size, strict=True)
-    )
     # data and network voxel size are the same b/c we're not rescaling the cube
     if signal_array is not None:
         dataset = CellMeasureStackDataset(
@@ -83,11 +142,13 @@ def _get_dataset(
     workers = min(workers, max_workers)
     workers = min(workers, len(cells) // batch_size)
 
+    # this will sample the dataset in the given sampler order (sorted by z)
     data_loader = DataLoader(
         dataset=dataset,
         sampler=sampler,
         batch_size=None,
         num_workers=workers,
+        worker_init_fn=_set_torch_threads,
     )
 
     return data_loader, dataset, sampler, workers
@@ -95,43 +156,44 @@ def _get_dataset(
 
 def _debug_display(
     cell: Cell,
-    r_lat_data,
-    r_axial_data,
-    lat_line,
-    ax_line,
-    plot_output_path,
-    cell_calc,
+    r_lat_data: dict[str, float],
+    r_axial_data: dict[str, float],
+    lat_line: np.ndarray,
+    ax_line: np.ndarray,
+    plot_output_path: Path,
+    cell_calc: CellSizeCalc,
 ) -> None:
     fig, (ax1, ax2) = plt.subplots(1, 2)
 
     z, y, x = cell.z, cell.y, cell.x
     vz, vy, vx = cell_calc.voxel_size
+    r_lat_data = {k: v for k, v in r_lat_data.items() if not k.endswith("std")}
+    r_axial_data = {
+        k: v for k, v in r_axial_data.items() if not k.endswith("std")
+    }
 
     ax1.plot(np.arange(len(lat_line)) * vy, lat_line, "k--", label="Measured")
 
     func = ""
     model_label = "Modeled"
     if cell_calc.lateral_decay_algorithm == "gaussian":
-        n = cell_calc.lateral_decay_len_voxels
+        n = cell_calc.lateral_line_length
         radii = np.linspace(-n / 4, n, 200)
         ax1.plot(
             radii * vy,
-            gaussian_func(radii, *r_lat_data[1:]),
+            gaussian_func(radii, **r_lat_data),
             "g-.",
             label=model_label,
         )
         model_label = None
 
-        a, off, sig, c = r_lat_data[1:]
         func = (
-            f"\n${a:0.2f}*e^{{-\\frac{{(\\frac{{r}}{{{vy:0.2f}}}-"
-            f"{off:0.2f})^{{2}}}}{{2*{sig:0.2f}^{{2}}}}}}+{c:0.2f}$"
-        )
+            "\n${a:0.2f}*e^{{-\\frac{{(\\frac{{r}}{{{vy:0.2f}}}-"
+            "{offset:0.2f})^{{2}}}}{{2*{sigma:0.2f}^{{2}}}}}}+{c:0.2f}$"
+        ).format(vy=vy, **r_lat_data)
 
-    p_hor = int(round(cell.metadata["r_y"] + r_lat_data[2]))
-    val = 0
-    if 0 <= p_hor < len(lat_line):
-        val = lat_line[p_hor]
+    p_hor = cell.metadata["r_xy"] + r_lat_data["offset"]
+    val = _interpolate(lat_line, p_hor, 0)
     ax1.plot(
         [p_hor * vy],
         [val],
@@ -141,32 +203,29 @@ def _debug_display(
 
     ax1.set_xlabel("Distance from point (microns)")
     ax1.set_ylabel("Normalized intensity")
-    std = int(cell.metadata["r_y_std"])
+    std = int(cell.metadata["r_xy_max_std"])
     ax1.set_title(f"Lateral radius (std={std}){func}")
 
     ax2.plot(np.arange(len(ax_line)) * vz, ax_line, "k--")
 
     func = ""
     if cell_calc.axial_decay_algorithm == "gaussian":
-        n = cell_calc.axial_decay_len_voxels
+        n = cell_calc.axial_line_length
         radii = np.linspace(-n / 4, n, 200)
         ax2.plot(
             radii * vz,
-            gaussian_func(radii, *r_axial_data[1:]),
+            gaussian_func(radii, **r_axial_data),
             "g-.",
             label=model_label,
         )
 
-        a, off, sig, c = r_axial_data[1:]
         func = (
-            f"\n${a:0.2f}*e^{{-\\frac{{(\\frac{{r}}{{{vz:0.2f}}}-"
-            f"{off:0.2f})^{{2}}}}{{2*{sig:0.2f}^{{2}}}}}}+{c:0.2f}$"
-        )
+            "\n${a:0.2f}*e^{{-\\frac{{(\\frac{{r}}{{{vz:0.2f}}}-"
+            "{offset:0.2f})^{{2}}}}{{2*{sigma:0.2f}^{{2}}}}}}+{c:0.2f}$"
+        ).format(vz=vz, **r_axial_data)
 
-    p_hor = int(round(cell.metadata["r_z"] + r_axial_data[2]))
-    val = 0
-    if 0 <= p_hor < len(ax_line):
-        val = ax_line[p_hor]
+    p_hor = cell.metadata["r_z"] + r_axial_data["offset"]
+    val = _interpolate(ax_line, p_hor, 0)
     ax2.plot(
         [p_hor * vz],
         [val],
@@ -176,7 +235,7 @@ def _debug_display(
 
     ax2.set_xlabel("Distance from point (microns)")
     ax2.set_ylabel("Normalized intensity")
-    std = int(cell.metadata["r_z_std"])
+    std = int(cell.metadata["r_z_max_std"])
     ax2.set_title(f"Axial radius (std={std}){func}")
 
     fig.legend(loc="lower center", ncols=3)
@@ -196,95 +255,127 @@ def _run_batches(
     dataset: CellMeasureTiffDataset | CellMeasureStackDataset,
     sampler: CuboidBatchSampler,
     cell_calc: CellSizeCalc,
-    points: list[Cell],
+    points: list[dict],
     plot_output_path: Path | None,
     debug_data: bool,
     status_callback: Callable[[int], None] | None,
 ):
     output_cells = []
     count = 0
-    z_center = dataset.get_cuboid_center("z", cell_calc.cube_voxels[0])
-    y_center = dataset.get_cuboid_center("y", cell_calc.cube_voxels[1])
-    x_center = dataset.get_cuboid_center("x", cell_calc.cube_voxels[2])
+    # data order is always z, y, x
+    z_center = get_cuboid_center("z", cell_calc.cube_voxels[0])
+    y_center = get_cuboid_center("y", cell_calc.cube_voxels[1])
+    x_center = get_cuboid_center("x", cell_calc.cube_voxels[2])
 
+    lat_params_names = cell_calc.lateral_parameters_names
+    axial_params_names = cell_calc.axial_parameters_names
+    lat_std_i = [
+        i for i, name in enumerate(lat_params_names) if name.endswith("std")
+    ]
+    ax_std_i = [
+        i for i, name in enumerate(axial_params_names) if name.endswith("std")
+    ]
+    lat_line_len = cell_calc.lateral_line_length
+    axial_line_len = cell_calc.axial_line_length
+
+    # data format as it comes out from the dataset is NxK, where K is flattened
+    # measured data of the cube/point. This happens in the dataset instance.
+    # We have to split it back into individual measurement objects
+    splits = [
+        3,  # 3d indices in the cube
+        4,  # intensity
+        5,  # lateral radius
+        5 + lat_line_len,  # lateral average line
+    ]
+    # params may be zero, e.g. if it's manual not Gaussian
+    splits.append(splits[-1] + len(lat_params_names))  # the lateral parameters
+    splits.append(splits[-1] + 1)  # axial radius
+    splits.append(splits[-1] + axial_line_len)  # axial average line
+    # remaining is len(axial_params_names) for the axial parameters
+
+    # data loader yields data in the same order as the sampler yields batches
     for data, batch in tqdm.tqdm(
         zip(data_loader, sampler, strict=True), total=len(sampler)
     ):
+        # data comes in as batches of torch tensors
         data = data.numpy()
 
-        splits = [
-            3,
-            4,
-            9,
-            13,
-            18,
-            22,
-            22 + cell_calc.lateral_max_radius_voxels + 1,
-        ]
         (
             center,
             intensity,
-            r_lat_data,
-            lat_debug,
-            r_axial_data,
-            ax_debug,
+            r_lat,
             lat_line,
+            lat_params_data,
+            r_axial,
             ax_line,
+            axial_params_data,
         ) = np.split(data, splits, axis=1)
         center = center.tolist()
         intensity = intensity.tolist()
-        r_lat_data = r_lat_data.tolist()
-        r_axial_data = r_axial_data.tolist()
+        r_lat = r_lat.tolist()
+        lat_params_data = lat_params_data.tolist()
+        r_axial = r_axial.tolist()
+        axial_params_data = axial_params_data.tolist()
 
         for i, point_i in enumerate(batch):
-            cell = points[point_i]
-            z, y, x = map(int, center[i])
-            r_lat, a_lat, offset_lat, sigma_lat, c_lat = r_lat_data[i]
-            r_ax, a_ax, offset_ax, sigma_ax, c_ax = r_axial_data[i]
+            point = points[point_i]
+            cell = Cell(
+                (point["x"], point["y"], point["z"]),
+                point["type"],
+                point["metadata"],
+            )
 
+            z, y, x = [int(round(c)) for c in center[i]]
+            # shift pos by the amount it shifted from center
             cell.z += z - z_center
             cell.y += y - y_center
             cell.x += x - x_center
 
             if not hasattr(cell, "metadata"):
                 cell.metadata = {}
-            r_lat_std = lat_debug[i].max().item()
             cell.metadata.update(
                 {
-                    "r_z": int(round(r_ax)),
-                    "r_y": int(round(r_lat)),
-                    "r_x": int(round(r_lat)),
-                    "center_intensity": intensity[i],
-                    "r_z_std": ax_debug[i].max().item(),
-                    "r_y_std": r_lat_std,
-                    "r_x_std": r_lat_std,
+                    "center_intensity": intensity[i][0],
+                    "r_xy": r_lat[i][0],
+                    "r_z": r_axial[i][0],
+                    "r_xy_max_std": -1,
+                    "r_z_max_std": -1,
                 }
             )
+            if lat_params_data[i]:
+                cell.metadata["r_xy_max_std"] = max(
+                    lat_params_data[i][k] for k in lat_std_i
+                )
+            if axial_params_data[i]:
+                cell.metadata["r_z_max_std"] = max(
+                    axial_params_data[i][k] for k in ax_std_i
+                )
+
             if debug_data:
-                cell.metadata["lateral_parameters"] = {
-                    "a": a_lat,
-                    "offset": offset_lat,
-                    "sigma": sigma_lat,
-                    "c": c_lat,
-                }
-                cell.metadata["lateral_parameters_std"] = lat_debug[i].tolist()
-                cell.metadata["lateral_line"] = lat_line[i].tolist()
-                cell.metadata["axial_parameters"] = {
-                    "a": a_ax,
-                    "offset": offset_ax,
-                    "sigma": sigma_ax,
-                    "c": c_ax,
-                }
-                cell.metadata["axial_parameters_std"] = ax_debug[i].tolist()
-                cell.metadata["axial_line"] = ax_line[i].tolist()
+                cell.metadata["r_xy_parameters"] = dict(
+                    zip(lat_params_names, lat_params_data[i], strict=False)
+                )
+                cell.metadata["r_z_parameters"] = dict(
+                    zip(axial_params_names, axial_params_data[i], strict=False)
+                )
+                cell.metadata["r_xy_radial_line"] = lat_line[i].tolist()
+                cell.metadata["r_z_radial_line"] = ax_line[i].tolist()
 
             output_cells.append(cell)
 
             if plot_output_path:
                 _debug_display(
                     cell,
-                    r_lat_data[i],
-                    r_axial_data[i],
+                    dict(
+                        zip(lat_params_names, lat_params_data[i], strict=False)
+                    ),
+                    dict(
+                        zip(
+                            axial_params_names,
+                            axial_params_data[i],
+                            strict=False,
+                        )
+                    ),
                     lat_line[i, :],
                     ax_line[i, :],
                     plot_output_path,
@@ -298,6 +389,7 @@ def _run_batches(
     return output_cells
 
 
+@_set_torch_threads_dec
 def main(
     *,
     cells: list[Cell],
@@ -329,6 +421,16 @@ def main(
     axial_decay_length: float = 35,
     axial_decay_fraction: float = 1 / math.e,
     axial_decay_algorithm: Literal["gaussian", "manual"] = "gaussian",
+    decay_gaussian_bounds: Sequence[float] = (
+        0.1,
+        1.25,
+        -0.25,
+        3,
+        0.1,
+        10.0,
+        -1,
+        1,
+    ),
     output_cells_path: Path | None = None,
     batch_size: int = 32,
     n_free_cpus: int = 2,
@@ -337,23 +439,70 @@ def main(
     debug_data: bool = False,
     status_callback: Callable[[int], None] | None = None,
 ) -> list[Cell]:
+    """
+    We expect the input data to have dimension order of z, y, x. All the
+    parameters (voxel_size etc.) are specified in this order.
+
+    cube_size, initial_center_search_radius etc are all in microns.
+
+    :param cells:
+    :param points_filenames:
+    :param signal_array:
+    :param voxel_size:
+    :param cube_size:
+    :param initial_center_search_radius:
+    :param initial_center_search_volume:
+    :param lateral_intensity_algorithm:
+    :param lateral_max_radius:
+    :param lateral_decay_length:
+    :param lateral_decay_fraction:
+    :param lateral_decay_algorithm:
+    :param axial_intensity_algorithm:
+    :param axial_max_radius:
+    :param axial_decay_length:
+    :param axial_decay_fraction:
+    :param axial_decay_algorithm:
+    :param decay_gaussian_bounds:
+    :param output_cells_path:
+    :param batch_size:
+    :param n_free_cpus:
+    :param max_workers:
+    :param plot_output_path:
+    :param debug_data:
+    :param status_callback:
+    :return:
+    """
+    logging.getLogger("matplotlib.font_manager").setLevel(logging.ERROR)
     ts = datetime.now()
+
+    if isinstance(cube_size, Number):
+        cube_size = cube_size, cube_size, cube_size
+    # convert cube size to real size by ensuring it's a multiple of voxel size
+    cube_voxels = tuple(
+        int(round(c / v)) for c, v in zip(cube_size, voxel_size, strict=False)
+    )
+    cube_size_um = [
+        c * v for c, v in zip(cube_voxels, voxel_size, strict=False)
+    ]
+
     cell_calc = CellSizeCalc(
         axial_dim=0,  # axis_order below is z, y, x
         voxel_size=voxel_size,
-        cube_size=cube_size,
-        initial_center_search_radius=initial_center_search_radius,
-        initial_center_search_volume=initial_center_search_volume,
+        cube_size_um=cube_size_um,
+        cuboid_center_func=_get_cuboid_center_by_index,
+        initial_center_search_radius_um=initial_center_search_radius,
+        initial_center_search_volume_um=initial_center_search_volume,
         lateral_intensity_algorithm=lateral_intensity_algorithm,
-        lateral_max_radius=lateral_max_radius,
-        lateral_decay_length=lateral_decay_length,
+        lateral_max_radius_um=lateral_max_radius,
+        lateral_decay_length_um=lateral_decay_length,
         lateral_decay_fraction=lateral_decay_fraction,
         lateral_decay_algorithm=lateral_decay_algorithm,
         axial_intensity_algorithm=axial_intensity_algorithm,
-        axial_max_radius=axial_max_radius,
-        axial_decay_length=axial_decay_length,
+        axial_max_radius_um=axial_max_radius,
+        axial_decay_length_um=axial_decay_length,
         axial_decay_fraction=axial_decay_fraction,
         axial_decay_algorithm=axial_decay_algorithm,
+        decay_gaussian_bounds=decay_gaussian_bounds,
     )
 
     logging.info(f"cell_meta_3d: Starting analysis of {len(cells)} cells")
@@ -363,7 +512,7 @@ def main(
         points_filenames,
         signal_array,
         voxel_size,
-        cube_size,
+        cube_voxels,
         batch_size,
         n_free_cpus,
         max_workers,
@@ -404,6 +553,17 @@ def run_main():
     output_cells = Path(args.output_cells_path)
     output_cells.parent.mkdir(parents=True, exist_ok=True)
 
+    fancylog.start_logging(
+        output_cells.parent,
+        cell_meta_3d,
+        variables=[
+            args,
+        ],
+        verbose=args.debug_data,
+        log_header="CellMeta3D Log",
+        multiprocessing_aware=True,
+    )
+
     main(
         cells=cells,
         signal_array=signal,
@@ -421,6 +581,7 @@ def run_main():
         axial_decay_length=args.axial_decay_length,
         axial_decay_fraction=args.axial_decay_fraction,
         axial_decay_algorithm=args.axial_decay_algorithm,
+        decay_gaussian_bounds=args.decay_gaussian_bounds,
         batch_size=args.batch_size,
         output_cells_path=output_cells,
         n_free_cpus=args.n_free_cpus,
