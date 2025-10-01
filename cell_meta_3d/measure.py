@@ -998,6 +998,7 @@ class CellSizeCalc:
             [min_scale, left_max_offset, min_sigma, min_y_offset],
             [max_scale, right_max_offset, max_sigma, max_y_offset],
         )
+        bad_result = -1, [0, 0, 0, 0], [0, 0, 0, 0]
 
         try:
             (a, offset, sigma, c), pcov = curve_fit(
@@ -1009,10 +1010,40 @@ class CellSizeCalc:
             )
             perr = np.sqrt(np.diag(pcov))
         except (RuntimeError, ValueError):
-            return -1, [0, 0, 0, 0], [0, 0, 0, 0]
+            return bad_result
 
-        desired_val = c + decay_fraction * a
-        r = math.sqrt(-2 * sigma**2 * math.log((desired_val - c) / a))
+        assert a > 0
+        if offset >= 0:
+            # if max of the data is shifted to the right (i.e. data[i] >
+            # data[0] for some i != 0), we treat it as if the max is at zero.
+            # So we drop offset and solve for r relative to max, which is now
+            # at i == 0. The radius is then the i relative to i == 0.
+
+            # First, if desired drop-off cannot be reached, return bad value
+            desired_val = decay_fraction * (a + c)
+            if c > desired_val:
+                return bad_result
+
+            temp = (a * decay_fraction + (decay_fraction - 1) * c) / a
+            temp = -2 * sigma**2 * math.log(temp)
+            assert temp >= 0
+            r = math.sqrt(temp)
+        else:
+            # the curve is shifted to left, so gaussian max is at i < 0 (i.e.
+            # real data starts after max). So we find the i, where the curve is
+            # at the desired fraction of curve at i == 0. That i is the radius.
+
+            # First, if desired drop-off cannot be reached, return bad value
+            y_0_unity = math.exp(-(offset**2) / (2 * sigma**2))
+            y_0 = a * y_0_unity + c
+            desired_val = decay_fraction * y_0
+            if c > desired_val:
+                return bad_result
+
+            temp = decay_fraction * y_0_unity + (decay_fraction - 1) * c / a
+            temp = -2 * sigma**2 * math.log(temp)
+            assert temp >= 0
+            r = math.sqrt(temp) + offset
 
         # r is relative to "offset" from center
         return r, [a, offset, sigma, c], perr.tolist()
