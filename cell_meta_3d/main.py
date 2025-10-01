@@ -1,6 +1,7 @@
 import logging
 import math
 from collections.abc import Callable, Sequence
+from copy import deepcopy
 from datetime import datetime
 from functools import wraps
 from numbers import Number
@@ -117,6 +118,7 @@ def _get_dataset(
             network_cuboid_voxels=cube_voxels,
             axis_order=("z", "y", "x"),
             output_axis_order=("z", "y", "x", "c"),
+            target_output="index",
         )
     elif points_filenames:
         dataset = CellMeasureTiffDataset(
@@ -128,6 +130,7 @@ def _get_dataset(
             network_cuboid_voxels=cube_voxels,
             axis_order=("z", "y", "x"),
             output_axis_order=("z", "y", "x", "c"),
+            target_output="index",
         )
     else:
         raise ValueError
@@ -255,7 +258,7 @@ def _run_batches(
     dataset: CellMeasureTiffDataset | CellMeasureStackDataset,
     sampler: CuboidBatchSampler,
     cell_calc: CellSizeCalc,
-    points: list[dict],
+    cells: list[Cell],
     plot_output_path: Path | None,
     debug_data: bool,
     status_callback: Callable[[int], None] | None,
@@ -293,10 +296,7 @@ def _run_batches(
     splits.append(splits[-1] + axial_line_len)  # axial average line
     # remaining is len(axial_params_names) for the axial parameters
 
-    # data loader yields data in the same order as the sampler yields batches
-    for data, batch in tqdm.tqdm(
-        zip(data_loader, sampler, strict=True), total=len(sampler)
-    ):
+    for data, indices in tqdm.tqdm(data_loader, total=len(data_loader)):
         # data comes in as batches of torch tensors
         data = data.numpy()
 
@@ -317,13 +317,8 @@ def _run_batches(
         r_axial = r_axial.tolist()
         axial_params_data = axial_params_data.tolist()
 
-        for i, point_i in enumerate(batch):
-            point = points[point_i]
-            cell = Cell(
-                (point["x"], point["y"], point["z"]),
-                point["type"],
-                point["metadata"],
-            )
+        for i, point_i in enumerate(indices.tolist()):
+            cell = deepcopy(cells[int(point_i)])
 
             z, y, x = [int(round(c)) for c in center[i]]
             # shift pos by the amount it shifted from center
@@ -382,7 +377,7 @@ def _run_batches(
                     cell_calc,
                 )
 
-        count += len(batch)
+        count += len(indices)
         if status_callback is not None:
             status_callback(count)
 
@@ -531,7 +526,7 @@ def main(
             dataset,
             sampler,
             cell_calc,
-            dataset.points,
+            cells,
             plot_output_path,
             debug_data,
             status_callback,
