@@ -1,4 +1,5 @@
 import numpy as np
+import pytest
 
 from cell_meta_3d.measure import CellSizeCalc, gaussian_func
 
@@ -51,3 +52,24 @@ def test_empty_cube():
     assert z == 10
     assert y == 25
     assert x == 25
+
+
+@pytest.mark.parametrize(
+    "x_start,y_max,x_r", [(-1, 1, 3.33), (0, 1, 3.33), (1, 0.883, 2.48)]
+)
+def test_shifted_gauss_center(x_start, y_max, x_r):
+    calc = CellSizeCalc()
+
+    x = np.array([-1, 0, 1, 2, 3, 4, 5, 6, 7, 8])
+    x = x[x_start + 1 :]
+    y = gaussian_func(x, 1, 0, 2, 0)
+    r, [a, offset, sigma, c], _ = calc.get_radius_from_gaussian(
+        y,
+        decay_fraction=0.25,
+        max_n=10,
+        left_max_offset=-1,
+    )
+
+    assert np.isclose(y_max, np.max(y), atol=0.1, rtol=0.05)
+    assert np.isclose(r, x_r, atol=0.1, rtol=0.05)
+    assert np.isclose(x_start, -offset, atol=0.1, rtol=0.05)
