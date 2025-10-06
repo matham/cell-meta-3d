@@ -1,4 +1,5 @@
 import math
+import sys
 from collections.abc import Callable, Sequence
 from multiprocessing import shared_memory
 from typing import Literal
@@ -6,6 +7,10 @@ from typing import Literal
 import numpy as np
 from numpy.lib.stride_tricks import sliding_window_view
 from scipy.optimize import curve_fit
+
+_shared_mem_kwargs = {}
+if (sys.version_info.major, sys.version_info.minor) >= (3, 13):
+    _shared_mem_kwargs = {"track": False}
 
 
 def _expand_num_triplet(
@@ -263,7 +268,7 @@ class CellSizeCalc:
             shm = shared_memory.SharedMemory(
                 name=state["_circle_masks_buffer"],
                 create=False,
-                track=False,
+                **_shared_mem_kwargs,
             )
             state["_circle_masks_buffer"] = shm
 
@@ -273,7 +278,7 @@ class CellSizeCalc:
         ):
             masks = np.ndarray(
                 state["_circle_masks"],
-                dtype=np.bool,
+                dtype=bool,
                 buffer=state["_circle_masks_buffer"].buf,
             )
             state["_circle_masks"] = masks
@@ -551,7 +556,7 @@ class CellSizeCalc:
             self.initial_center_search_radius_voxels[i]
             for i in self.lateral_dims
         ]
-        center = self.cube_center_voxels
+        center = [self.cube_center_voxels[i] for i in self.lateral_dims]
         sizes = [self.cube_voxels[i] for i in self.lateral_dims]
         r = self.lateral_max_radius_voxels
         decay = self.lateral_decay_len_voxels
@@ -576,13 +581,15 @@ class CellSizeCalc:
             if right + r >= size:
                 raise ValueError(
                     f"Requested lateral line with size {r} voxels and "
-                    f"potential center offset of {c_offset} voxels. This is "
+                    f"potential center offset of {c_offset} voxels from "
+                    f"the center at {c}. This is "
                     f"larger than the size of the cube {size} voxels"
                 )
             if left - r < 0:
                 raise ValueError(
                     f"Requested lateral line with size {r} voxels and "
-                    f"potential center offset of negative {c_offset} voxels. "
+                    f"potential center offset of negative {c_offset} voxels "
+                    f"from the center at {c}. "
                     f"This is larger than the size of the cube {size} voxels"
                 )
 
@@ -610,13 +617,15 @@ class CellSizeCalc:
         if right + r >= size:
             raise ValueError(
                 f"Requested axial line with size {r} voxels and "
-                f"potential center offset of {c_offset} voxels. This is "
+                f"potential center offset of {c_offset} voxels from "
+                f"the center at {c}. This is "
                 f"larger than the size of the cube {size} voxels"
             )
         if left - r < 0:
             raise ValueError(
                 f"Requested axial line with size {r} voxels and "
-                f"potential center offset of negative {c_offset} voxels. "
+                f"potential center offset of negative {c_offset} voxels "
+                f"from the center at {c}. "
                 f"This is larger than the size of the cube {size} voxels"
             )
 
@@ -785,13 +794,15 @@ class CellSizeCalc:
         )
 
         # create a shared memory numpy array, that is shared with sub-processes
-        single_bytes = np.zeros(1, dtype=np.bool).nbytes
+        single_bytes = np.zeros(1, dtype=bool).nbytes
         total_bytes = math.prod(masks_shape) * single_bytes
         shm = shared_memory.SharedMemory(
-            create=True, size=total_bytes, track=False
+            create=True,
+            size=total_bytes,
+            **_shared_mem_kwargs,
         )
 
-        masks = np.ndarray(masks_shape, dtype=np.bool, buffer=shm.buf)
+        masks = np.ndarray(masks_shape, dtype=bool, buffer=shm.buf)
         masks[...] = 0
 
         # grid the plane with the largest coordinates we can have. Both max_r
