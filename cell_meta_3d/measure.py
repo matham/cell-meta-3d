@@ -159,7 +159,7 @@ class CellSizeCalc:
         axial_decay_algorithm: Literal["gaussian", "manual"] = "gaussian",
         decay_gaussian_bounds: Sequence[float] = (
             0.1,
-            1.25,
+            1.0,
             -0.25,
             3,
             0.1,
@@ -984,7 +984,7 @@ class CellSizeCalc:
         decay_fraction: float,
         max_n: int,
         min_scale: float = 0.1,
-        max_scale: float = 1.25,
+        max_scale: float = 1.0,
         left_max_offset: float = -0.25,
         right_max_offset: float = 3,
         min_sigma: float = 0.1,

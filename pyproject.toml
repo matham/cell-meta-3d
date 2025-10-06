@@ -55,7 +55,7 @@ cell-meta-3d = "cell_meta_3d.napari:napari.yaml"
 "User Support" = "https://github.com/matham/cell-meta-3d/issues"
 
 [project.scripts]
-call_meta_3d = "cell_meta_3d.main:run_main"
+cell_meta_3d = "cell_meta_3d.main:run_main"
 
 [build-system]
 requires = ["setuptools>=42.0.0", "wheel", "setuptools_scm"]
