@@ -287,8 +287,9 @@ def _run_batches(
     splits = [
         3,  # 3d indices in the cube
         4,  # intensity
-        5,  # lateral radius
-        5 + lat_line_len,  # lateral average line
+        5,  # min intensity
+        6,  # lateral radius
+        6 + lat_line_len,  # lateral average line
     ]
     # params may be zero, e.g. if it's manual not Gaussian
     splits.append(splits[-1] + len(lat_params_names))  # the lateral parameters
@@ -303,6 +304,7 @@ def _run_batches(
         (
             center,
             intensity,
+            min_intensity,
             r_lat,
             lat_line,
             lat_params_data,
@@ -312,6 +314,7 @@ def _run_batches(
         ) = np.split(data, splits, axis=1)
         center = center.tolist()
         intensity = intensity.tolist()
+        min_intensity = min_intensity.tolist()
         r_lat = r_lat.tolist()
         lat_params_data = lat_params_data.tolist()
         r_axial = r_axial.tolist()
@@ -331,6 +334,7 @@ def _run_batches(
             cell.metadata.update(
                 {
                     "center_intensity": intensity[i][0],
+                    "min_intensity": min_intensity[i][0],
                     "r_xy": r_lat[i][0],
                     "r_z": r_axial[i][0],
                     "r_xy_max_std": -1,

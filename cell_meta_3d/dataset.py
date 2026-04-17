@@ -67,11 +67,13 @@ class CellMeasureDatasetBase:
         intensity = np_data[
             np.arange(len(np_data)), center[:, 0], center[:, 1], center[:, 2]
         ]
+        min_intensity = np.min(np_data, axis=(1, 2, 3))
 
         # convert it to a flat NxK array so we can convert it to torch
         arrays = [
             center,
             intensity[:, None],
+            min_intensity[:, None],
             r_lat[:, None],
             lat_line,
         ]
