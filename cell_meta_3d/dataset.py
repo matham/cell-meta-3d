@@ -3,8 +3,8 @@ from typing import Union
 import numpy as np
 import torch
 from cellfinder.core.classify.cube_generator import (
+    CuboidArrayDataset,
     CuboidDatasetBase,
-    CuboidStackDataset,
     CuboidTiffDataset,
 )
 from numpy.lib import recfunctions as rfn
@@ -87,7 +87,7 @@ class CellMeasureDatasetBase:
         return torch.from_numpy(output).to(device=data.device)
 
 
-class CellMeasureStackDataset(CellMeasureDatasetBase, CuboidStackDataset):
+class CellMeasureStackDataset(CellMeasureDatasetBase, CuboidArrayDataset):
     pass
 
 
