@@ -33,6 +33,7 @@ dependencies = [
     "cellfinder",
     "scipy",
     "fancylog",
+    "matplotlib",
 ]
 
 [project.optional-dependencies]
