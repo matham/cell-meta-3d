@@ -1,11 +1,11 @@
 import math
 import sys
 from collections.abc import Callable, Sequence
+from functools import cache
 from multiprocessing import shared_memory
 from typing import Literal
 
 import numpy as np
-from numpy.lib.stride_tricks import sliding_window_view
 from scipy.optimize import curve_fit
 
 _shared_mem_kwargs = {}
@@ -60,23 +60,14 @@ class CellSizeCalc:
     cube_voxels: tuple[int, int, int]
 
     initial_center_search_radius_voxels: tuple[int, int, int]
-    """The radius around the center, in each dim, along which to search for
-    a higher central intensity. If we find a better intensity (using the volume
-    initial_center_search_volume_voxels around that point), we use that as the
-    new cell center.
+    """The radius around the center, in each dim, along which to iteratively
+    search for a higher central intensity. If we find a better intensity at
+    each step in the volume of size 1 around the current center, we use that
+    as the new cell center for the iteration. Until it stabilizes.
 
     The radius is in addition to the center. E.g. if the radius is `2`, then
     we'll consider for a total of 5 center points: the center, and 2 voxels on
     each side of the original center.
-
-    Unit is in voxels.
-    """
-    initial_center_search_volume_voxels: tuple[int, int, int]
-    """The volume size to use when searching for the best center. We compute
-    the overall intensity of a volume of this size, around a potential cell
-    center. A value of zero, means just use the center voxel. Otherwise, it's
-    centered on the center voxel. E.g. a value of 1 would be the center voxel
-    plus a voxel on one side.
 
     Unit is in voxels.
     """
@@ -109,16 +100,13 @@ class CellSizeCalc:
     # the center of the cube
     cube_center_voxels: np.ndarray
 
-    # 4d tuple of slices, indicating the sub-volume of the cube we need, in
-    # order to search for a better cell center. For each dim (first is
-    # slice(None) for batch dim) it's the slice to extract the volume of that
-    # dim
-    _center_search_data_indices: tuple[slice, slice, slice, slice] | None
     # the index in the cube of the first (start) voxel we consider as new
     # center for each of the 3d. E.g. if the original center is 10, and we
     # search a radius of 2 on each side, this would be 8 for that dim. It's
     # cube_center_voxels if there's no shifts. It has an extra first dim
     _center_search_start: np.ndarray
+    # same as above, but last index we include in search (12 in above example)
+    _center_search_end: np.ndarray
 
     # the np masks buffer that helps us calc circles of different sizes, at
     # different offsets from the original cube center
@@ -140,11 +128,6 @@ class CellSizeCalc:
         cuboid_center_func: Callable[[int, int], int] = default_center,
         initial_center_search_radius_um: float | tuple[float, float, float] = (
             10,
-            3,
-            3,
-        ),
-        initial_center_search_volume_um: float | tuple[float, float, float] = (
-            15,
             3,
             3,
         ),
@@ -194,13 +177,6 @@ class CellSizeCalc:
             initial_center_search_radius_um, voxel_size
         )
 
-        initial_center_search_volume_um = _expand_num_triplet(
-            initial_center_search_volume_um
-        )
-        self.initial_center_search_volume_voxels = _norm_by_size(
-            initial_center_search_volume_um, voxel_size
-        )
-
         lat_voxels = [r for i, r in enumerate(voxel_size) if i != axial_dim]
         lat_vox = sum(lat_voxels) / 2
         axial_vox = voxel_size[axial_dim]
@@ -224,12 +200,25 @@ class CellSizeCalc:
             dtype=np.int_,
         )
 
+        if any(self.initial_center_search_radius_voxels):
+            self._center_search_start = (
+                self.cube_center_voxels
+                - self.initial_center_search_radius_voxels
+            )[None, ...]
+            self._center_search_end = (
+                self.cube_center_voxels
+                + self.initial_center_search_radius_voxels
+            )[None, ...]
+        else:
+            self._center_search_start = self.cube_center_voxels[None, ...]
+            self._center_search_end = self.cube_center_voxels[None, ...]
+
         self.decay_gaussian_bounds = decay_gaussian_bounds
 
         self._verify_lateral_parameters()
         self._verify_axial_parameters()
 
-        self._calc_find_pos_center_window()
+        self._check_do_center_search()
         if self.lateral_intensity_algorithm.startswith("area"):
             self._make_circle_masks()
 
@@ -428,67 +417,43 @@ class CellSizeCalc:
 
         return r_arr, params_arr
 
-    def _calc_find_pos_center_window(self) -> None:
-        """Pre-calculates the sub-regions of the cuboid we need in order to
-        search for a new and better center.
+    @cache
+    def _check_do_center_search(self) -> bool:
         """
-        center_data_indices = [slice(None)]
-        center_search_offset = []
+        Checks that cubes is big enough for the requested search size with
+        centered search window of 3.
+        """
+        # only pre-calc if we can adjust the cube center by at least one in
+        # each direction
+        if not all(r for r in self.initial_center_search_radius_voxels):
+            return False
 
-        # only pre-calc if we adjust the cube center in at least one direction
-        if not any(self.initial_center_search_radius_voxels):
-            self._center_search_data_indices = None
-            # no shift
-            self._center_search_start = self.cube_center_voxels[None, :]
-            return
-
-        for c, dim, sides, win in zip(
+        for c, dim, sides in zip(
             self.cube_center_voxels,
             self.cube_voxels,
             self.initial_center_search_radius_voxels,
-            self.initial_center_search_volume_voxels,
             strict=True,
         ):
             # we search sides voxels on each side, not including the original c
-            if not sides:
-                start = end = c
-            else:
-                start = c - sides
-                end = c + sides + 1
+            start = c - sides
+            end = c + sides + 1
 
-            # win of zero means just use center voxel
-            if win < 0:
-                raise ValueError(
-                    f"Requested a center search volume width of {win} voxels. "
-                    f"We need at least a window of 0 voxels"
-                )
-            # split window into (unequal) halves (if not even)
-            half_win = win // 2
-            rest_win = win - half_win
+            # we have to add to start/end that many voxels for a window of size
+            # 3 around center
+            start -= 1
+            end += 1
 
-            # we have to add to start that many voxels, not including start
-            start -= half_win
-            # the center is inclusive so adding rest_win, we have window size
-            # of win + 1. We need +1 because win of zero means just the center
-            end += rest_win
-
-            center_data_indices.append(slice(start, end))
             if start < 0 or end > dim:
                 raise ValueError(
                     f"The cube size of {dim} voxels is too small for a center "
                     f"adjustment search of {sides} voxels on each side, with a"
-                    f" volume window size of {win} voxels. For a cube center "
+                    f" centered window size of {3} voxels. For a cube center "
                     f"of {c} voxels, we would have needed a sub-region of "
                     f"[{start}, {end}) with size {end - start} voxels, which "
                     f"extends beyond the full cube"
                 )
 
-            center_search_offset.append(c - sides)
-
-        self._center_search_data_indices = tuple(center_data_indices)
-        self._center_search_start = np.array(
-            [center_search_offset], dtype=np.int_
-        )
+        return True
 
     def find_pos_center_max(
         self,
@@ -506,50 +471,103 @@ class CellSizeCalc:
             the same.
         """
         n = len(data)
+        centers = np.repeat(self.cube_center_voxels[None, ...], n, axis=0)
 
-        if self._center_search_data_indices is None:
-            # no search - the center is the original center. Just add batch dim
-            max_idx = self.cube_center_voxels[None, ...]
-            return np.repeat(max_idx, n, axis=0)
+        # only pre-calc if we adjust the cube center in at least one direction
+        if not self._check_do_center_search():
+            # no search - the center is the original center
+            return centers
 
-        # extract the padded 3d sub-region to search
-        data = data[self._center_search_data_indices]
-        # create a bunch of 3d sliding windows across the 3 data dims. For each
-        # voxel in the data (not including the padding, only in the search
-        # radius) we generate a volume of the asked size. So we end up with 7D.
-        # The 1st dim is batch, 2nd - 4th the search area (e.g. if the search r
-        # for a dim is 1, the size of that dim is 3), 5th - 7th is the win_size
-        # We add one to window, because zero means just the center voxel etc.
-        win_size = [v + 1 for v in self.initial_center_search_volume_voxels]
-        windows = sliding_window_view(data, win_size, axis=(1, 2, 3))
-        # for each voxel in the search are, add up the total intensity of the
-        # volume around that voxel. Back to 4D of the search area size
-        intensity = np.sum(windows, axis=(4, 5, 6), dtype=np.float64)
+        starts = self._center_search_start
+        ends = self._center_search_end
 
-        # flatten the search area so we can search more easily
-        flat_intensity = intensity.reshape((n, -1))
-        # check if all intensities are the same for a given cube
-        all_same = np.all(
-            flat_intensity[:, 0][:, None] == flat_intensity, axis=1
-        )
+        # mask indicating which of the original batch items center is still
+        # being updated
+        remaining_mask = np.ones(data.shape[0], dtype=bool)
+        # batch data containing only batch items whose center is still being
+        # updated
+        remaining_data = data
+        rem_n = n
 
-        flat_max = flat_intensity.argmax(axis=1)
-        # convert back to 2D indices, with 2nd dim the max index of each cube
-        max_idx = np.column_stack(
-            np.unravel_index(flat_max, intensity.shape[1:])
-        )
-        assert len(max_idx) == n
+        # indices in each dim to the center and the item before and after it so
+        # as to get a window on 3 around center
+        center_vol_indices_rem = [
+            np.concatenate(
+                [centers[:, :1] - 1, centers[:, :1], centers[:, :1] + 1],
+                axis=1,
+            )[:, :, None, None],
+            np.concatenate(
+                [centers[:, 1:2] - 1, centers[:, 1:2], centers[:, 1:2] + 1],
+                axis=1,
+            )[:, None, :, None],
+            np.concatenate(
+                [centers[:, 2:3] - 1, centers[:, 2:3], centers[:, 2:3] + 1],
+                axis=1,
+            )[:, None, None, :],
+        ]
 
-        # the indices of the max is relative to the start of the search area
-        max_idx += self._center_search_start
-        # set it back to center if they were all the same
-        max_idx = np.add(
-            max_idx,
-            [self.initial_center_search_radius_voxels],
-            out=max_idx,
-            where=all_same[:, None],
-        )
-        return max_idx
+        win_center_index = np.ravel_multi_index((1, 1, 1), (3, 3, 3))
+        while True:
+            batch_ind = np.arange(rem_n)
+
+            # get the 3x3x3 volume around current center of each item
+            center_vol = remaining_data[batch_ind, *center_vol_indices_rem]
+            cval = center_vol[:, 1, 1, 1]
+            data_win = center_vol.reshape((rem_n, -1))
+
+            i_max = np.argmax(data_win, axis=1)
+            # for which batch items did the location of the max value not shift
+            # from last center? Drop those batch items
+            same = np.logical_or(
+                i_max == win_center_index, cval == data_win[batch_ind, i_max]
+            )
+            not_same = np.logical_not(same)
+
+            remaining_data = remaining_data[not_same, ...]
+            rem_n = remaining_data.shape[0]
+
+            # if we dropped all remaining data items, there's nothing to do
+            if not rem_n:
+                break
+
+            remaining_mask[remaining_mask] = not_same
+
+            i_max = i_max[not_same]
+            offsets = np.unravel_index(i_max, (3, 3, 3))
+
+            for i, offset in enumerate(offsets):
+                center_vol_indices_rem[i] = center_vol_indices_rem[i][
+                    not_same, ...
+                ]
+                # shift the center zero or plus or minus one for the volume
+                # indices
+                center_vol_indices_rem[i] += offset[:, None] - 1
+                # update the center to new value
+                centers[remaining_mask, i] = np.take(
+                    center_vol_indices_rem[i], 1, axis=i + 1
+                )[:, 0, 0]
+
+            # check if we hit the edge in any dim for remaining data
+            rem_centers = centers[remaining_mask, :]
+            hit_edge = np.any(
+                np.logical_or(rem_centers == starts, rem_centers == ends),
+                axis=1,
+            )
+            no_edge = np.logical_not(hit_edge)
+
+            # keep only those who didn't hit edge
+            remaining_data = remaining_data[no_edge, ...]
+            rem_n = remaining_data.shape[0]
+            if not rem_n:
+                break
+
+            remaining_mask[remaining_mask] = no_edge
+            for i in range(3):
+                center_vol_indices_rem[i] = center_vol_indices_rem[i][
+                    no_edge, ...
+                ]
+
+        return centers
 
     def _verify_lateral_parameters(self):
         center_offsets = [
@@ -569,23 +587,23 @@ class CellSizeCalc:
             )
 
         for c, c_offset, size in zip(
-            center, center_offsets, sizes, strict=False
+            center, center_offsets, sizes, strict=True
         ):
-            # number of elements inclusive of the center
-            right = size - (c + c_offset)
-            # same - number of elements inclusive of the center
-            left = c - c_offset + 1
+            # last element exclusive of the center
+            right = c + c_offset + r
+            # same - first element exclusive of the center
+            left = c - c_offset - r
 
             # don't need to check for decay because decay <= r
             # number of elements is center plus r
-            if right + r >= size:
+            if right >= size:
                 raise ValueError(
                     f"Requested lateral line with size {r} voxels and "
                     f"potential center offset of {c_offset} voxels from "
                     f"the center at {c}. This is "
                     f"larger than the size of the cube {size} voxels"
                 )
-            if left - r < 0:
+            if left < 0:
                 raise ValueError(
                     f"Requested lateral line with size {r} voxels and "
                     f"potential center offset of negative {c_offset} voxels "

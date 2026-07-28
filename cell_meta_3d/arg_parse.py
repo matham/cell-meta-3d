@@ -71,14 +71,6 @@ def cell_meta_3d_parser() -> ArgumentParser:
         default=[10, 3, 3],
     )
     parser.add_argument(
-        "-initial-v",
-        "--initial-center-search-volume",
-        dest="initial_center_search_volume",
-        nargs=3,
-        type=partial(check_positive_float, none_allowed=False),
-        default=[15, 3, 3],
-    )
-    parser.add_argument(
         "-lat-int-algo",
         "--lateral-intensity-algorithm",
         dest="lateral_intensity_algorithm",

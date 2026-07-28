@@ -56,8 +56,8 @@ def _set_torch_threads_dec(f: Callable[P, T]) -> Callable[P, T]:
 def get_cuboid_center(axis: str, size: int) -> int:
     # use a point at zero, this will give us the start of the cube relative
     # to zero. Then, abs of that will be the distance from start to center
-    start, _ = get_data_cuboid_range(0, size, axis)
-    return abs(start)
+    start, end = get_data_cuboid_range(size, size, axis)
+    return size - start
 
 
 def _get_cuboid_center_by_index(ax: int, size: int) -> int:
@@ -401,11 +401,6 @@ def main(
         3,
         3,
     ),
-    initial_center_search_volume: float | tuple[float, float, float] = (
-        15,
-        3,
-        3,
-    ),
     lateral_intensity_algorithm: Literal[
         "center_line", "area", "area_margin"
     ] = "area_margin",
@@ -450,7 +445,6 @@ def main(
     :param voxel_size:
     :param cube_size:
     :param initial_center_search_radius:
-    :param initial_center_search_volume:
     :param lateral_intensity_algorithm:
     :param lateral_max_radius:
     :param lateral_decay_length:
@@ -473,15 +467,20 @@ def main(
     """
     logging.getLogger("matplotlib.font_manager").setLevel(logging.ERROR)
     ts = datetime.now()
+    cube_size_um = cube_size
 
-    if isinstance(cube_size, Number):
-        cube_size = cube_size, cube_size, cube_size
+    if isinstance(cube_size_um, Number):
+        cube_size_um = cube_size_um, cube_size_um, cube_size_um
     # convert cube size to real size by ensuring it's a multiple of voxel size
-    cube_voxels = tuple(
-        int(round(c / v)) for c, v in zip(cube_size, voxel_size, strict=False)
+    cube_size_voxels = tuple(
+        int(round(c / v))
+        for c, v in zip(cube_size_um, voxel_size, strict=False)
     )
+    # make sure it'll be even voxels to avoid rounding issues when getting the
+    # cube data, which displace center unpredictably
+    cube_size_voxels = [(v + 1) if v % 2 else v for v in cube_size_voxels]
     cube_size_um = [
-        c * v for c, v in zip(cube_voxels, voxel_size, strict=False)
+        c * v for c, v in zip(cube_size_voxels, voxel_size, strict=False)
     ]
 
     cell_calc = CellSizeCalc(
@@ -490,7 +489,6 @@ def main(
         cube_size_um=cube_size_um,
         cuboid_center_func=_get_cuboid_center_by_index,
         initial_center_search_radius_um=initial_center_search_radius,
-        initial_center_search_volume_um=initial_center_search_volume,
         lateral_intensity_algorithm=lateral_intensity_algorithm,
         lateral_max_radius_um=lateral_max_radius,
         lateral_decay_length_um=lateral_decay_length,
@@ -511,7 +509,7 @@ def main(
         points_filenames,
         signal_array,
         voxel_size,
-        cube_voxels,
+        cube_size_voxels,
         batch_size,
         n_free_cpus,
         max_workers,
@@ -569,7 +567,6 @@ def run_main():
         voxel_size=args.voxel_size,
         cube_size=args.cube_size,
         initial_center_search_radius=args.initial_center_search_radius,
-        initial_center_search_volume=args.initial_center_search_volume,
         lateral_intensity_algorithm=args.lateral_intensity_algorithm,
         lateral_max_radius=args.lateral_max_radius,
         lateral_decay_length=args.lateral_decay_length,

@@ -13,7 +13,7 @@ from cellfinder.napari.utils import (
     brainglobe_points_axis_order,
     napari_array_to_cells,
 )
-from magicgui import magicgui
+from magicgui import magicgui, widgets
 from magicgui.widgets import FunctionGui, ProgressBar
 from napari.qt.threading import WorkerBase, WorkerBaseSignals
 from napari.utils.notifications import show_info
@@ -159,7 +159,7 @@ def reraise(e: Exception) -> None:
     raise Exception from e
 
 
-def analyse_widget():
+def analyse_widget() -> widgets.Container:
     progress_bar = ProgressBar()
 
     # options that is filled in from the gui
@@ -182,7 +182,6 @@ def analyse_widget():
         voxel_size: tuple[float, float, float] = (5, 1, 1),
         cube_size: tuple[float, float, float] = (100, 50, 50),
         initial_center_search_radius: tuple[float, float, float] = (10, 3, 3),
-        initial_center_search_volume: tuple[float, float, float] = (15, 3, 3),
         lateral_intensity_algorithm: Literal[
             "center_line", "area", "area_margin"
         ] = "area_margin",
@@ -244,7 +243,6 @@ def analyse_widget():
             voxel_size=voxel_size,
             cube_size=cube_size,
             initial_center_search_radius=initial_center_search_radius,
-            initial_center_search_volume=initial_center_search_volume,
             lateral_intensity_algorithm=lateral_intensity_algorithm,
             lateral_max_radius=lateral_max_radius,
             lateral_decay_length=lateral_decay_length,
@@ -278,4 +276,12 @@ def analyse_widget():
     )
     widget.insert(widget.index("output_cells_path") + 1, progress_bar)
 
-    return widget
+    container = widgets.Container(
+        widgets=[widget],
+        layout="vertical",
+        labels=False,
+        scrollable=True,
+    )
+
+    # needed for enabling scrolling
+    return container.root_native_widget
