@@ -1,11 +1,16 @@
 import math
 import sys
 from collections.abc import Callable, Sequence
-from functools import cache
+from functools import cache, cached_property
 from multiprocessing import shared_memory
 from typing import Literal
 
 import numpy as np
+import scipy.ndimage
+import skimage
+from cellfinder.core.detect.filters.volume.laplacian_filter import (
+    get_27_stencil,
+)
 from scipy.optimize import curve_fit
 
 _shared_mem_kwargs = {}
@@ -97,6 +102,8 @@ class CellSizeCalc:
 
     decay_gaussian_bounds: Sequence[float]
 
+    decay_fraction: float
+
     # the center of the cube
     cube_center_voxels: np.ndarray
 
@@ -166,6 +173,9 @@ class CellSizeCalc:
         self.axial_intensity_algorithm = axial_intensity_algorithm
         self.axial_decay_algorithm = axial_decay_algorithm
         self.axial_decay_fraction = axial_decay_fraction
+        self.decay_fraction = (
+            2 * lateral_decay_fraction + axial_decay_fraction
+        ) / 3
 
         cube_size_um = _expand_num_triplet(cube_size_um)
         self.cube_voxels = _norm_by_size(cube_size_um, voxel_size)
@@ -308,6 +318,10 @@ class CellSizeCalc:
     def axial_line_length(self):
         return self.axial_max_radius_voxels + 1
 
+    @cached_property
+    def laplacian_kernel(self):
+        return get_27_stencil(self.voxel_size)
+
     def __call__(self, data: np.ndarray) -> tuple[
         np.ndarray,
         np.ndarray,
@@ -316,6 +330,7 @@ class CellSizeCalc:
         np.ndarray,
         np.ndarray,
         np.ndarray | None,
+        np.ndarray,
     ]:
         """
         Ideally, we would shift the center by the amount estimate during
@@ -372,6 +387,19 @@ class CellSizeCalc:
             self.axial_decay_len_voxels + 1,
         )
 
+        center_values = self.get_center_values(data, center)
+        data_min = np.min(data, axis=(1, 2, 3))
+        segmentation_intensity_threshold = self.get_segmentation_threshold(
+            data, data_min, center, center_values, self.decay_fraction
+        )
+        segmentation_mask = self.get_segmentation_mask(
+            data,
+            data_min,
+            center,
+            segmentation_intensity_threshold,
+            self.laplacian_kernel,
+        )
+
         return (
             center,
             r_lat,
@@ -380,6 +408,7 @@ class CellSizeCalc:
             r_axial,
             ax_line,
             r_axial_params,
+            segmentation_mask,
         )
 
     def _get_decay_radius(
@@ -1090,3 +1119,120 @@ class CellSizeCalc:
 
         r = np.where(has_max, np.argmax(less_mask, axis=1), -1)
         return r
+
+    def get_center_values(
+        self, data: np.ndarray, center: np.ndarray
+    ) -> np.ndarray:
+        return data[
+            np.arange(data.shape[0]), center[:, 0], center[:, 1], center[:, 2]
+        ]
+
+    def get_segmentation_threshold(
+        self,
+        data: np.ndarray,
+        global_min_data: np.ndarray,
+        center: np.ndarray,
+        center_values: np.ndarray,
+        decay_fraction: float,
+    ) -> np.ndarray:
+        """
+        Gets threshold by finding local min closest to cell center and using
+        that as local min value.
+        """
+        n = data.shape[0]
+        local_min_data = np.empty(n)
+
+        for i in range(n):
+            item_data = data[i, ...]
+            cval = center_values[i]
+
+            local_min_coords = skimage.feature.peak_local_max(
+                -(item_data - global_min_data[i]),
+                min_distance=1,
+                exclude_border=False,
+                num_peaks_per_label=1,
+            )
+
+            min_global = global_min_data[i]
+            min_local = min_global
+            if len(local_min_coords):
+                if len(local_min_coords) == 1:
+                    min_local = item_data[*local_min_coords[0]]
+                else:
+                    dist = np.sum(
+                        np.square(local_min_coords - center[i][None, :]),
+                        axis=1,
+                    )
+                    min_i = np.argmin(dist)
+                    min_local = item_data[*local_min_coords[min_i]]
+
+                if min_local >= cval:
+                    min_local = min_global
+
+            local_min_data[i] = min_local
+
+            if np.isclose(min_global, cval):
+                raise ValueError(
+                    "Center intensity is too similar to the global min"
+                )
+
+        threshold = (
+            center_values - local_min_data
+        ) * decay_fraction + local_min_data
+
+        return threshold
+
+    def get_segmentation_mask(
+        self,
+        data: np.ndarray,
+        global_min_data: np.ndarray,
+        center: np.ndarray,
+        threshold: np.ndarray,
+        kernel: np.ndarray,
+    ):
+        n = data.shape[0]
+        above_threshold_data = data > threshold[:, None, None, None]
+        laplacian_data = scipy.ndimage.convolve(
+            data, kernel, axes=(1, 2, 3), mode="nearest"
+        )
+        segmentation_mask = np.empty(data.shape, dtype=bool)
+
+        for i in range(n):
+            item_data = data[i, ...]
+            c1, c2, c3 = center[i]
+            above_threshold = above_threshold_data[i, ...]
+
+            local_max_mask = np.zeros(item_data.shape, dtype=bool)
+
+            local_max_coords = skimage.feature.peak_local_max(
+                item_data,
+                min_distance=1,
+                exclude_border=False,
+                num_peaks_per_label=1,
+            )
+            local_max_mask[tuple(local_max_coords.T)] = True
+            local_max_mask[c1, c2, c3] = True
+
+            local_max_coords = skimage.feature.peak_local_max(
+                laplacian_data[i, ...],
+                min_distance=1,
+                exclude_border=False,
+                num_peaks_per_label=1,
+            )
+            local_max_mask[tuple(local_max_coords.T)] = True
+
+            peak_markers = skimage.measure.label(
+                local_max_mask, connectivity=2
+            )
+            labels = skimage.segmentation.watershed(
+                -(item_data - global_min_data[i]),
+                markers=peak_markers,
+                mask=above_threshold,
+                connectivity=3,
+                compactness=50,
+            )
+
+            inside = labels == labels[c1, c2, c3]
+            segmentation_mask[i, ...] = np.logical_and(above_threshold, inside)
+
+        return segmentation_mask

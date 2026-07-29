@@ -2,6 +2,7 @@
 
 import math
 from collections.abc import Callable
+from functools import partial
 from pathlib import Path
 from typing import Any, Literal
 
@@ -84,6 +85,73 @@ class Worker(WorkerBase):
             "Finished analysis", len(self.cells), len(self.cells)
         )
         return cells
+
+
+def _add_sphere_layers(
+    cells: list[Cell], viewer: napari.Viewer, data_layer: napari.layers.Image
+):
+    for cell in cells:
+        z = cell.z
+        y = cell.y
+        x = cell.x
+
+        r_xy = max(cell.metadata["r_xy"], 1)
+        r_z = max(cell.metadata["r_z"], 1)
+        size_xy = max(int(round(2 * cell.metadata["r_xy"])), 1) + 2
+        size_z = max(int(round(2 * cell.metadata["r_z"])), 1) + 2
+        c_xy = size_xy / 2
+        c_z = size_z / 2
+
+        zg, yg, xg = np.mgrid[0:size_z:1, 0:size_xy:1, 0:size_xy:1]
+        r = np.sqrt(
+            ((zg - c_z) / r_z) ** 2
+            + ((yg - c_xy) / r_xy) ** 2
+            + ((xg - c_xy) / r_xy) ** 2
+        )
+        sphere = np.zeros((*r.shape, 4))
+        sphere[r <= 1, :] = 1
+
+        viewer.add_image(
+            sphere,
+            name=f"{z}z{y}y{x}x sphere",
+            scale=data_layer.scale,
+            translate=(z - c_z, y - c_xy, x - c_xy),
+            rgb=True,
+        )
+
+
+def _add_segmentation_layers(
+    cells: list[Cell], viewer: napari.Viewer, data_layer: napari.layers.Image
+):
+    for cell in cells:
+        mask = cell.metadata["segmentation_mask"][:, :, :, None]
+        mask = np.repeat(mask, 4, axis=3)
+
+        z, y, x = cell.z, cell.y, cell.x
+        center = np.array([z, y, x])
+        offset = center - np.array(mask.shape[:3]) / 2
+
+        viewer.add_image(
+            mask,
+            name=f"{z}z{y}y{x}x mask",
+            scale=data_layer.scale,
+            translate=offset,
+            rgb=True,
+        )
+
+
+def process_worker_result(
+    cells: list[Cell],
+    viewer: napari.Viewer,
+    data_layer: napari.layers.Image,
+    add_sphere_layers: bool,
+    add_segmentation_layers: bool,
+):
+    if add_sphere_layers:
+        _add_sphere_layers(cells, viewer, data_layer)
+
+    if add_segmentation_layers:
+        _add_segmentation_layers(cells, viewer, data_layer)
 
 
 def get_heavy_widgets(
@@ -201,6 +269,8 @@ def analyse_widget() -> widgets.Container:
         n_free_cpus: int = 2,
         max_workers: int = 3,
         plot_output_path: Path | None = None,
+        add_sphere_layers: bool = False,
+        add_segmentation_layers: bool = False,
         save_plots: bool = False,
         debug_data: bool = False,
     ) -> None:
@@ -265,6 +335,15 @@ def analyse_widget() -> widgets.Container:
         # thread
         worker.errored.connect(reraise)
         worker.connect_progress_bar_callback(progress_bar)
+        worker.returned.connect(
+            partial(
+                process_worker_result,
+                viewer=options["viewer"],
+                data_layer=signal_image,
+                add_sphere_layers=add_sphere_layers,
+                add_segmentation_layers=add_segmentation_layers,
+            )
+        )
 
         worker.start()
 

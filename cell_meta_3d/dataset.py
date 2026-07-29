@@ -57,6 +57,7 @@ class CellMeasureDatasetBase:
             r_axial,
             ax_line,
             r_axial_params,
+            segmentation_mask,
         ) = cell_calc(np_data)
         if len(lat_line.shape) != 2:
             lat_line = lat_line[:, None]
@@ -83,6 +84,7 @@ class CellMeasureDatasetBase:
         arrays.extend([r_axial[:, None], ax_line])
         if r_axial_params is not None:
             arrays.append(rfn.structured_to_unstructured(r_axial_params))
+        arrays.append(segmentation_mask.reshape(data.shape[0], -1))
 
         output = np.concatenate(arrays, axis=1)
 

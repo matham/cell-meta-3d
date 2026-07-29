@@ -295,7 +295,8 @@ def _run_batches(
     splits.append(splits[-1] + len(lat_params_names))  # the lateral parameters
     splits.append(splits[-1] + 1)  # axial radius
     splits.append(splits[-1] + axial_line_len)  # axial average line
-    # remaining is len(axial_params_names) for the axial parameters
+    splits.append(splits[-1] + len(axial_params_names))  # the axial parameters
+    # remaining is cube size for the segmentation mask
 
     for data, indices in tqdm.tqdm(data_loader, total=len(data_loader)):
         # data comes in as batches of torch tensors
@@ -311,6 +312,7 @@ def _run_batches(
             r_axial,
             ax_line,
             axial_params_data,
+            segmentation_mask,
         ) = np.split(data, splits, axis=1)
         center = center.tolist()
         intensity = intensity.tolist()
@@ -319,6 +321,9 @@ def _run_batches(
         lat_params_data = lat_params_data.tolist()
         r_axial = r_axial.tolist()
         axial_params_data = axial_params_data.tolist()
+        segmentation_mask = segmentation_mask.astype(bool).reshape(
+            (len(data), *cell_calc.cube_voxels)
+        )
 
         for i, point_i in enumerate(indices.tolist()):
             cell = deepcopy(cells[int(point_i)])
@@ -339,6 +344,7 @@ def _run_batches(
                     "r_z": r_axial[i][0],
                     "r_xy_max_std": -1,
                     "r_z_max_std": -1,
+                    "segmentation_mask": segmentation_mask[i],
                 }
             )
             if lat_params_data[i]:
@@ -536,8 +542,15 @@ def main(
     finally:
         dataset.stop_dataset_thread()
 
+    # temporarily remove segmentation mask so it doesn't get saved to yaml
+    segmentations = [
+        c.metadata.pop("segmentation_mask", None) for c in output_cells
+    ]
     save_cells(output_cells, str(output_cells_path))
     logging.info(f"cell_meta_3d: Analysis took {datetime.now() - ts}")
+
+    for cell, segmentation in zip(output_cells, segmentations, strict=False):
+        cell.metadata["segmentation_mask"] = segmentation
 
     return output_cells
 
