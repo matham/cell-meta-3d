@@ -177,5 +177,11 @@ def cell_meta_3d_parser() -> ArgumentParser:
         dest="debug_data",
         action="store_true",
     )
+    parser.add_argument(
+        "--segmentation-path",
+        dest="segmentation_path",
+        type=check_str,
+        default="",
+    )
 
     return parser

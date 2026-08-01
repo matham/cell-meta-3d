@@ -8,8 +8,10 @@ from numbers import Number
 from pathlib import Path
 from typing import Literal, ParamSpec, TypeVar
 
+import h5py
 import matplotlib.pyplot as plt
 import numpy as np
+import tifffile
 import torch
 import tqdm
 from brainglobe_utils.cells.cells import Cell
@@ -253,6 +255,105 @@ def _debug_display(
         plt.show()
 
 
+def create_segmentation_datasets(
+    cell_calc: CellSizeCalc,
+    points_filenames: Sequence[str] | None,
+    signal_array: types.array | None,
+    batch_size: int,
+    h5_file: h5py.File,
+) -> dict[str, h5py.Dataset]:
+    h5_file.attrs["cube_voxels"] = cell_calc.cube_voxels
+
+    mask_index_dtype = np.uint16
+    if all(s <= 256 for s in cell_calc.cube_voxels):
+        mask_index_dtype = np.uint8
+
+    intensity_index = h5_file.create_dataset(
+        "intensity_index",
+        shape=(0, 3),
+        maxshape=(None, 3),
+        chunks=(5 * 5 * 5 * batch_size * 10, 3),
+        dtype=mask_index_dtype,
+        compression="gzip",
+    )
+
+    if signal_array is not None:
+        dtype = signal_array.dtype
+    else:
+        dtype = tifffile.imread(points_filenames[0]).dtype
+    intensity = h5_file.create_dataset(
+        "intensity",
+        shape=(0,),
+        maxshape=(None,),
+        chunks=(5 * 5 * 5 * batch_size * 10,),
+        dtype=dtype,
+        compression="gzip",
+    )
+
+    cell_index_range = h5_file.create_dataset(
+        "cell_index_range",
+        shape=(0, 2),
+        maxshape=(None, 2),
+        chunks=(batch_size * 10, 2),
+        dtype=np.int64,
+        compression="gzip",
+    )
+
+    cell_corner = h5_file.create_dataset(
+        "cell_corner",
+        shape=(0, 3),
+        maxshape=(None, 3),
+        chunks=(batch_size * 10, 3),
+        dtype=np.uint32,
+        compression="gzip",
+    )
+
+    h5_datasets = {
+        "cell_index_range": cell_index_range,
+        "intensity": intensity,
+        "intensity_index": intensity_index,
+        "cell_corner": cell_corner,
+    }
+
+    return h5_datasets
+
+
+def append_segmentation_data_h5(
+    h5_datasets: dict[str, h5py.Dataset],
+    segmentation_mask: np.ndarray,
+    raw_intensity: np.ndarray,
+    cells: list[Cell],
+    cube_center: tuple[int, int, int],
+):
+    n = segmentation_mask.shape[0]
+    old_size_flat = len(h5_datasets["intensity"])
+    old_size_batch = len(h5_datasets["cell_index_range"])
+
+    dset = h5_datasets["intensity_index"]
+    _, zi, yi, xi = np.nonzero(segmentation_mask)
+    dset.resize(old_size_flat + len(zi), axis=0)
+    dset[old_size_flat:, 0] = zi
+    dset[old_size_flat:, 1] = yi
+    dset[old_size_flat:, 2] = xi
+
+    dset = h5_datasets["intensity"]
+    flat = raw_intensity[segmentation_mask]
+    dset.resize(old_size_flat + len(flat), axis=0)
+    dset[old_size_flat:] = flat
+
+    dset = h5_datasets["cell_index_range"]
+    dset.resize(old_size_batch + n, axis=0)
+    counts = segmentation_mask.reshape((n, -1)).sum(axis=1)
+    ends = np.cumsum(counts) + old_size_flat
+    dset[old_size_batch:, 0] = ends - counts
+    dset[old_size_batch:, 1] = ends
+
+    dset = h5_datasets["cell_corner"]
+    dset.resize(old_size_batch + n, axis=0)
+    cell_centers = np.array([[c.z, c.y, c.x] for c in cells])
+    dset[old_size_batch:, :] = cell_centers - [cube_center]
+
+
 def _run_batches(
     data_loader: DataLoader,
     dataset: CellMeasureTiffDataset | CellMeasureStackDataset,
@@ -261,6 +362,7 @@ def _run_batches(
     cells: list[Cell],
     plot_output_path: Path | None,
     debug_data: bool,
+    h5_datasets: dict[str, h5py.Dataset],
     status_callback: Callable[[int], None] | None,
 ):
     output_cells = []
@@ -278,33 +380,13 @@ def _run_batches(
     ax_std_i = [
         i for i, name in enumerate(axial_params_names) if name.endswith("std")
     ]
-    lat_line_len = cell_calc.lateral_line_length
-    axial_line_len = cell_calc.axial_line_length
 
-    # data format as it comes out from the dataset is NxK, where K is flattened
-    # measured data of the cube/point. This happens in the dataset instance.
-    # We have to split it back into individual measurement objects
-    splits = [
-        3,  # 3d indices in the cube
-        4,  # intensity
-        5,  # min intensity
-        6,  # lateral radius
-        6 + lat_line_len,  # lateral average line
-    ]
-    # params may be zero, e.g. if it's manual not Gaussian
-    splits.append(splits[-1] + len(lat_params_names))  # the lateral parameters
-    splits.append(splits[-1] + 1)  # axial radius
-    splits.append(splits[-1] + axial_line_len)  # axial average line
-    splits.append(splits[-1] + len(axial_params_names))  # the axial parameters
-    # remaining is cube size for the segmentation mask
-
-    for data, indices in tqdm.tqdm(data_loader, total=len(data_loader)):
+    total_cells = 0
+    for batch, indices in tqdm.tqdm(data_loader, total=len(data_loader)):
         # data comes in as batches of torch tensors
-        data = data.numpy()
-
         (
             center,
-            intensity,
+            center_intensity,
             min_intensity,
             r_lat,
             lat_line,
@@ -313,45 +395,98 @@ def _run_batches(
             ax_line,
             axial_params_data,
             segmentation_mask,
-        ) = np.split(data, splits, axis=1)
+            paor_vectors_intensity,
+            paor_centroid_intensity,
+            paor_moment2_intensity,
+            paor_extent_intensity,
+            paor_vectors_mask,
+            paor_centroid_mask,
+            paor_moment2_mask,
+            paor_extent_mask,
+            raw_intensity,
+        ) = [item.numpy() for item in batch]
+        center = np.round(center).astype(int)
+        indices = indices.numpy().astype(int)
+
+        if h5_datasets:
+            append_segmentation_data_h5(
+                h5_datasets,
+                segmentation_mask,
+                raw_intensity,
+                [cells[point_i] for point_i in indices],
+                (z_center, y_center, x_center),
+            )
+
+        # convert to list so items become native python type
         center = center.tolist()
-        intensity = intensity.tolist()
+        center_intensity = center_intensity.tolist()
         min_intensity = min_intensity.tolist()
         r_lat = r_lat.tolist()
         lat_params_data = lat_params_data.tolist()
         r_axial = r_axial.tolist()
         axial_params_data = axial_params_data.tolist()
-        segmentation_mask = segmentation_mask.astype(bool).reshape(
-            (len(data), *cell_calc.cube_voxels)
-        )
+        paor_vectors_intensity = paor_vectors_intensity.tolist()
+        paor_centroid_intensity = paor_centroid_intensity.tolist()
+        paor_moment2_intensity = paor_moment2_intensity.tolist()
+        paor_extent_intensity = paor_extent_intensity.tolist()
+        paor_vectors_mask = paor_vectors_mask.tolist()
+        paor_centroid_mask = paor_centroid_mask.tolist()
+        paor_moment2_mask = paor_moment2_mask.tolist()
+        paor_extent_mask = paor_extent_mask.tolist()
+        volume = np.sum(segmentation_mask, axis=(1, 2, 3)).tolist()
 
-        for i, point_i in enumerate(indices.tolist()):
-            cell = deepcopy(cells[int(point_i)])
+        for i, point_i in enumerate(indices):
+            cell = deepcopy(cells[point_i])
+            corner = cell.z - z_center, cell.y - y_center, cell.x - x_center
 
-            z, y, x = [int(round(c)) for c in center[i]]
+            z, y, x = center[i]
             # shift pos by the amount it shifted from center
-            cell.z += z - z_center
-            cell.y += y - y_center
-            cell.x += x - x_center
+            cell.z = corner[0] + z
+            cell.y = corner[1] + y
+            cell.x = corner[2] + x
 
             if not hasattr(cell, "metadata"):
                 cell.metadata = {}
             cell.metadata.update(
                 {
-                    "center_intensity": intensity[i][0],
-                    "min_intensity": min_intensity[i][0],
-                    "r_xy": r_lat[i][0],
-                    "r_z": r_axial[i][0],
+                    "intensity": center_intensity[i],
+                    "min_intensity": min_intensity[i],
+                    "r_xy_vox": r_lat[i],
+                    "r_z_vox": r_axial[i],
                     "r_xy_max_std": -1,
                     "r_z_max_std": -1,
                     "segmentation_mask": segmentation_mask[i],
+                    "seg_id": total_cells,
+                    "volume_vox": volume[i],
+                    "paor_xyz_vox": paor_vectors_intensity[i],
+                    "paor_shape_xyz_vox": paor_vectors_mask[i],
+                    "paor_centroid_xyz_vox": [
+                        cr + cn
+                        for cr, cn in zip(
+                            corner[::-1],
+                            paor_centroid_intensity[i],
+                            strict=False,
+                        )
+                    ],
+                    "paor_centroid_shape_xyz_vox": [
+                        cr + cn
+                        for cr, cn in zip(
+                            corner[::-1], paor_centroid_mask[i], strict=False
+                        )
+                    ],
+                    "paor_um5": paor_moment2_intensity[i],
+                    "paor_shape_um5": paor_moment2_mask[i],
+                    "paor_extent_um": paor_extent_intensity[i],
+                    "paor_extent_shape_um": paor_extent_mask[i],
                 }
             )
-            if lat_params_data[i]:
+            total_cells += 1
+
+            if len(lat_params_data[i]):
                 cell.metadata["r_xy_max_std"] = max(
                     lat_params_data[i][k] for k in lat_std_i
                 )
-            if axial_params_data[i]:
+            if len(axial_params_data[i]):
                 cell.metadata["r_z_max_std"] = max(
                     axial_params_data[i][k] for k in ax_std_i
                 )
@@ -436,6 +571,7 @@ def main(
     n_free_cpus: int = 2,
     max_workers: int = 6,
     plot_output_path: Path | str | None = None,
+    segmentation_path: Path | str | None = None,
     debug_data: bool = False,
     status_callback: Callable[[int], None] | None = None,
 ) -> list[Cell]:
@@ -526,6 +662,17 @@ def main(
         plot_output_path = Path(plot_output_path)
         plot_output_path.parent.mkdir(parents=True, exist_ok=True)
 
+    h5_file = None
+    h5_datasets = {}
+    if segmentation_path:
+        segmentation_path = Path(segmentation_path)
+        segmentation_path.parent.mkdir(parents=True, exist_ok=True)
+        h5_file = h5py.File(segmentation_path, "w")
+
+        h5_datasets = create_segmentation_datasets(
+            cell_calc, points_filenames, signal_array, batch_size, h5_file
+        )
+
     if workers:
         dataset.start_dataset_thread(workers)
     try:
@@ -537,22 +684,39 @@ def main(
             cells,
             plot_output_path,
             debug_data,
+            h5_datasets,
             status_callback,
         )
     finally:
-        dataset.stop_dataset_thread()
+        try:
+            dataset.stop_dataset_thread()
+        finally:
+            if h5_file is not None:
+                h5_file.close()
+
+    # remove duplicate cells - can happen if moving center shifted multiple
+    # cells to same center
+    dedup_cells = []
+    seen = set()
+    for cell in output_cells:
+        key = cell.x, cell.y, cell.z
+        if key in seen:
+            continue
+
+        dedup_cells.append(cell)
+        seen.add(key)
 
     # temporarily remove segmentation mask so it doesn't get saved to yaml
     segmentations = [
-        c.metadata.pop("segmentation_mask", None) for c in output_cells
+        c.metadata.pop("segmentation_mask", None) for c in dedup_cells
     ]
-    save_cells(output_cells, str(output_cells_path))
+    save_cells(dedup_cells, str(output_cells_path))
     logging.info(f"cell_meta_3d: Analysis took {datetime.now() - ts}")
 
-    for cell, segmentation in zip(output_cells, segmentations, strict=False):
+    for cell, segmentation in zip(dedup_cells, segmentations, strict=False):
         cell.metadata["segmentation_mask"] = segmentation
 
-    return output_cells
+    return dedup_cells
 
 
 def run_main():
@@ -596,6 +760,7 @@ def run_main():
         n_free_cpus=args.n_free_cpus,
         max_workers=args.max_workers,
         plot_output_path=args.plot_output_path,
+        segmentation_path=args.segmentation_path,
         debug_data=args.debug_data,
     )
 

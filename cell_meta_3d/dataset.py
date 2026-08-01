@@ -28,7 +28,7 @@ class CellMeasureDatasetBase:
     def convert_to_output(
         self: Union["CuboidDatasetBase", "CellMeasureDatasetBase"],
         data: torch.Tensor,
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | tuple[torch.Tensor, ...]:
         """
         We do our own conversion to output. By default, it converts it so the
         network can process the data. Instead, we pass it through the
@@ -58,11 +58,15 @@ class CellMeasureDatasetBase:
             ax_line,
             r_axial_params,
             segmentation_mask,
+            paor_vectors_intensity,
+            paor_centroid_intensity,
+            paor_moment2_intensity,
+            paor_extent_intensity,
+            paor_vectors_mask,
+            paor_centroid_mask,
+            paor_moment2_mask,
+            paor_extent_mask,
         ) = cell_calc(np_data)
-        if len(lat_line.shape) != 2:
-            lat_line = lat_line[:, None]
-        if len(ax_line.shape) != 2:
-            ax_line = ax_line[:, None]
 
         # get the center intensity of the points
         intensity = np_data[
@@ -70,25 +74,41 @@ class CellMeasureDatasetBase:
         ]
         min_intensity = np.min(np_data, axis=(1, 2, 3))
 
-        # convert it to a flat NxK array so we can convert it to torch
-        arrays = [
+        arrays = (
             center,
-            intensity[:, None],
-            min_intensity[:, None],
-            r_lat[:, None],
+            intensity,
+            min_intensity,
+            r_lat,
             lat_line,
-        ]
-        if r_lat_params is not None:
-            # structured_to_unstructured will always create 2d array
-            arrays.append(rfn.structured_to_unstructured(r_lat_params))
-        arrays.extend([r_axial[:, None], ax_line])
-        if r_axial_params is not None:
-            arrays.append(rfn.structured_to_unstructured(r_axial_params))
-        arrays.append(segmentation_mask.reshape(data.shape[0], -1))
+            (
+                np.array([])
+                if r_lat_params is None
+                else rfn.structured_to_unstructured(r_lat_params)
+            ),
+            r_axial,
+            ax_line,
+            (
+                np.array([])
+                if r_axial_params is None
+                else rfn.structured_to_unstructured(r_axial_params)
+            ),
+            segmentation_mask,
+            paor_vectors_intensity,
+            paor_centroid_intensity,
+            paor_moment2_intensity,
+            paor_extent_intensity,
+            paor_vectors_mask,
+            paor_centroid_mask,
+            paor_moment2_mask,
+            paor_extent_mask,
+        )
 
-        output = np.concatenate(arrays, axis=1)
+        arrays = tuple(
+            torch.from_numpy(arr).to(device=data.device) for arr in arrays
+        )
+        arrays = *arrays, data[..., 0]
 
-        return torch.from_numpy(output).to(device=data.device)
+        return arrays
 
 
 class CellMeasureStackDataset(CellMeasureDatasetBase, CuboidArrayDataset):

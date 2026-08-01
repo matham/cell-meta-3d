@@ -34,6 +34,9 @@ dependencies = [
     "scipy",
     "fancylog",
     "matplotlib",
+    "h5py",
+    "scikit-image",
+    "tifffile",
 ]
 
 [project.optional-dependencies]
@@ -57,6 +60,7 @@ cell-meta-3d = "cell_meta_3d.napari:napari.yaml"
 
 [project.scripts]
 cell_meta_3d = "cell_meta_3d.main:run_main"
+cell_meta_3d_seg2tiff = "cell_meta_3d.seg2tif:run_main"
 
 [build-system]
 requires = ["setuptools>=42.0.0", "wheel", "setuptools_scm"]

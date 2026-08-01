@@ -331,6 +331,14 @@ class CellSizeCalc:
         np.ndarray,
         np.ndarray | None,
         np.ndarray,
+        np.ndarray,
+        np.ndarray,
+        np.ndarray,
+        np.ndarray,
+        np.ndarray,
+        np.ndarray,
+        np.ndarray,
+        np.ndarray,
     ]:
         """
         Ideally, we would shift the center by the amount estimate during
@@ -400,6 +408,22 @@ class CellSizeCalc:
             self.laplacian_kernel,
         )
 
+        (
+            paor_vectors_intensity,
+            paor_centroid_intensity,
+            paor_moment2_intensity,
+            paor_extent_intensity,
+            paor_vectors_mask,
+            paor_centroid_mask,
+            paor_moment2_mask,
+            paor_extent_mask,
+        ) = self.get_segmentation_vectors(
+            data,
+            center,
+            segmentation_mask,
+            (2, 1, 0),
+        )
+
         return (
             center,
             r_lat,
@@ -409,6 +433,14 @@ class CellSizeCalc:
             ax_line,
             r_axial_params,
             segmentation_mask,
+            paor_vectors_intensity,
+            paor_centroid_intensity,
+            paor_moment2_intensity,
+            paor_extent_intensity,
+            paor_vectors_mask,
+            paor_centroid_mask,
+            paor_moment2_mask,
+            paor_extent_mask,
         )
 
     def _get_decay_radius(
@@ -540,7 +572,9 @@ class CellSizeCalc:
             batch_ind = np.arange(rem_n)
 
             # get the 3x3x3 volume around current center of each item
-            center_vol = remaining_data[batch_ind, *center_vol_indices_rem]
+            center_vol = remaining_data[
+                batch_ind[:, None, None, None], *center_vol_indices_rem
+            ]
             cval = center_vol[:, 1, 1, 1]
             data_win = center_vol.reshape((rem_n, -1))
 
@@ -570,7 +604,7 @@ class CellSizeCalc:
                 ]
                 # shift the center zero or plus or minus one for the volume
                 # indices
-                center_vol_indices_rem[i] += offset[:, None] - 1
+                center_vol_indices_rem[i] += offset[:, None, None, None] - 1
                 # update the center to new value
                 centers[remaining_mask, i] = np.take(
                     center_vol_indices_rem[i], 1, axis=i + 1
@@ -1236,3 +1270,200 @@ class CellSizeCalc:
             segmentation_mask[i, ...] = np.logical_and(above_threshold, inside)
 
         return segmentation_mask
+
+    def get_segmentation_vectors(
+        self,
+        data: np.ndarray,
+        center: np.ndarray,
+        segmentation_mask: np.ndarray,
+        xyz_order: tuple[int, int, int],
+    ) -> tuple[
+        np.ndarray,
+        np.ndarray,
+        np.ndarray,
+        np.ndarray,
+        np.ndarray,
+        np.ndarray,
+        np.ndarray,
+        np.ndarray,
+    ]:
+        spacing = [self.voxel_size[ax] for ax in xyz_order]
+        sx, sy, sz = spacing
+        cube_voxels = [self.cube_voxels[ax] for ax in xyz_order]
+        zoomed_size = int(
+            math.ceil(
+                max(
+                    [v * s for v, s in zip(cube_voxels, spacing, strict=False)]
+                )
+            )
+        )
+        n = data.shape[0]
+
+        center = center.round().astype(np.intp)
+        cval = data[np.arange(n), center[:, 0], center[:, 1], center[:, 2]][
+            :, None, None, None
+        ]
+        masked_data = data / cval
+        masked_data[np.logical_not(segmentation_mask)] = 0
+        masked_data = np.moveaxis(
+            masked_data.astype(np.float64),
+            (1, 2, 3),
+            [ax + 1 for ax in xyz_order],
+        )
+
+        segmentation = np.moveaxis(
+            segmentation_mask.astype(np.float64),
+            (1, 2, 3),
+            [ax + 1 for ax in xyz_order],
+        )
+
+        paor_vectors_intensity = np.empty((n, 3, 3))
+        paor_centroid_intensity = np.empty((n, 3))
+        paor_moment2_intensity = np.empty((n, 3))
+        paor_extent_intensity = np.empty((n, 3))
+        paor_vectors_mask = np.empty((n, 3, 3))
+        paor_centroid_mask = np.empty((n, 3))
+        paor_moment2_mask = np.empty((n, 3))
+        paor_extent_mask = np.empty((n, 3))
+
+        # we calculate the moments of inertia of the cell as well the moments
+        # of inertial of the shape of the cell not accounting for the intensity
+        # at each voxel. Then we transform it to the principal axes of
+        # rotation, which is what we want using the inertia
+        # eigenvalues/vectors, which are along those axes
+        for i in range(n):
+            for volume, vectors, centroid, moment2, extent in [
+                (
+                    masked_data,
+                    paor_vectors_mask,
+                    paor_centroid_mask,
+                    paor_moment2_mask,
+                    paor_extent_mask,
+                ),
+                (
+                    segmentation,
+                    paor_vectors_intensity,
+                    paor_centroid_intensity,
+                    paor_moment2_intensity,
+                    paor_extent_intensity,
+                ),
+            ]:
+                moments = skimage.measure.moments(
+                    volume[i, ...], order=1, spacing=spacing
+                )
+                cdx = moments[1, 0, 0] / moments[0, 0, 0]
+                cdy = moments[0, 1, 0] / moments[0, 0, 0]
+                cdz = moments[0, 0, 1] / moments[0, 0, 0]
+                centroid[i, :] = cdx, cdy, cdz
+
+                central_moments = skimage.measure.moments_central(
+                    volume[i, ...],
+                    center=[cdx, cdy, cdz],
+                    order=2,
+                    spacing=spacing,
+                )
+                moment_mat = np.array(
+                    [
+                        [
+                            central_moments[2, 0, 0],
+                            central_moments[1, 1, 0],
+                            central_moments[1, 0, 1],
+                        ],
+                        [
+                            central_moments[1, 1, 0],
+                            central_moments[0, 2, 0],
+                            central_moments[0, 1, 1],
+                        ],
+                        [
+                            central_moments[1, 0, 1],
+                            central_moments[0, 1, 1],
+                            central_moments[0, 0, 2],
+                        ],
+                    ]
+                )
+
+                eigenvalues, eigenvectors = np.linalg.eigh(moment_mat)
+
+                # it's ordered so largest eigenvalue is last and columns are
+                # vectors. We want rows to be vectors and first row largest etc
+                eigenvectors = np.flip(eigenvectors.transpose(), axis=1)
+                eigenvalues = eigenvalues[::-1]
+
+                # if last eigenvector is not same direction as cross product,
+                # we need to flip it
+                if not np.allclose(
+                    np.cross(eigenvectors[0, :], eigenvectors[1, :]),
+                    eigenvectors[2, :],
+                ):
+                    eigenvectors[2, :] *= -1
+                assert np.allclose(
+                    np.cross(eigenvectors[0, :], eigenvectors[1, :]),
+                    eigenvectors[2, :],
+                )
+
+                vectors[i, :] = eigenvectors
+                moment2[i, :] = eigenvalues
+
+                center_mat = np.array(
+                    [
+                        [1, 0, 0, -cdx / sx],
+                        [0, 1, 0, -cdy / sy],
+                        [0, 0, 1, -cdz / sz],
+                        [0, 0, 0, 1],
+                    ]
+                )
+                zoom_mat = np.array(
+                    [[sx, 0, 0, 0], [0, sy, 0, 0], [0, 0, sz, 0], [0, 0, 0, 1]]
+                )
+                # I thought we need to multiply by inverse eigenvectors, which
+                # we did above. But seems that's not the case, so invert it
+                # back...
+                rotate_mat = np.eye(4)
+                rotate_mat[:3, :3] = eigenvectors.transpose()
+                uncenter_mat = np.array(
+                    [
+                        [1, 0, 0, zoomed_size / 2],
+                        [0, 1, 0, zoomed_size / 2],
+                        [0, 0, 1, zoomed_size / 2],
+                        [0, 0, 0, 1],
+                    ]
+                )
+                # first move volume to center of original axis by given voxels.
+                # Then zoom so each voxel is a micron. Then rotate by unit
+                # vectors so cell aligns to xyz axis, and then move it to the
+                # center of output cuboid
+                forward_mat = uncenter_mat @ rotate_mat @ zoom_mat @ center_mat
+                # scipy expects the pull matrix of the opposite order so invert
+                inverse_mat = np.linalg.inv(forward_mat)
+                # we don't want any smoothing because we just want voxel counts
+                # in um
+                cell_aligned = scipy.ndimage.affine_transform(
+                    volume[i, ...],
+                    inverse_mat,
+                    order=0,
+                    mode="nearest",
+                    output_shape=(zoomed_size, zoomed_size, zoomed_size),
+                    prefilter=False,
+                )
+
+                # now just find containing box to get diameter in each axis
+                xi, yi, zi = np.nonzero(cell_aligned)
+                extent[i, 0] = xi.max() - xi.min() + 1
+                extent[i, 1] = yi.max() - yi.min() + 1
+                extent[i, 2] = zi.max() - zi.min() + 1
+
+        # it comes out in units of spacing, convert back to voxels
+        paor_centroid_intensity /= spacing
+        paor_centroid_mask /= spacing
+
+        # the moments themselves (eigenvalues) stay in units of spacing
+        return (
+            paor_vectors_intensity,
+            paor_centroid_intensity,
+            paor_moment2_intensity,
+            paor_extent_intensity,
+            paor_vectors_mask,
+            paor_centroid_mask,
+            paor_moment2_mask,
+            paor_extent_mask,
+        )
