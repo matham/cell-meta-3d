@@ -1386,7 +1386,7 @@ class CellSizeCalc:
 
                 # it's ordered so largest eigenvalue is last and columns are
                 # vectors. We want rows to be vectors and first row largest etc
-                eigenvectors = np.flip(eigenvectors.transpose(), axis=1)
+                eigenvectors = np.flip(eigenvectors.transpose(), axis=0)
                 eigenvalues = eigenvalues[::-1]
 
                 # if last eigenvector is not same direction as cross product,
@@ -1415,11 +1415,11 @@ class CellSizeCalc:
                 zoom_mat = np.array(
                     [[sx, 0, 0, 0], [0, sy, 0, 0], [0, 0, sz, 0], [0, 0, 0, 1]]
                 )
-                # I thought we need to multiply by inverse eigenvectors, which
-                # we did above. But seems that's not the case, so invert it
-                # back...
+                # multiply by inverse of the unit vectors to apply negative
+                # angle. eigenvectors start as columns and it's now transposed,
+                # which is the inverse
                 rotate_mat = np.eye(4)
-                rotate_mat[:3, :3] = eigenvectors.transpose()
+                rotate_mat[:3, :3] = eigenvectors
                 uncenter_mat = np.array(
                     [
                         [1, 0, 0, zoomed_size / 2],

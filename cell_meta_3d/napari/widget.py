@@ -90,15 +90,16 @@ class Worker(WorkerBase):
 def _add_sphere_layers(
     cells: list[Cell], viewer: napari.Viewer, data_layer: napari.layers.Image
 ):
+    sz, sy, sx = data_layer.scale
     for cell in cells:
         z = cell.z
         y = cell.y
         x = cell.x
 
-        r_xy = max(cell.metadata["r_xy"], 1)
-        r_z = max(cell.metadata["r_z"], 1)
-        size_xy = max(int(round(2 * cell.metadata["r_xy"])), 1) + 2
-        size_z = max(int(round(2 * cell.metadata["r_z"])), 1) + 2
+        r_xy = max(cell.metadata["r_xy_vox"], 1)
+        r_z = max(cell.metadata["r_z_vox"], 1)
+        size_xy = max(int(round(2 * cell.metadata["r_xy_vox"])), 1) + 2
+        size_z = max(int(round(2 * cell.metadata["r_z_vox"])), 1) + 2
         c_xy = size_xy / 2
         c_z = size_z / 2
 
@@ -114,8 +115,8 @@ def _add_sphere_layers(
         viewer.add_image(
             sphere,
             name=f"{z}z{y}y{x}x sphere",
-            scale=data_layer.scale,
-            translate=(z - c_z, y - c_xy, x - c_xy),
+            scale=[sz, sy, sx],
+            translate=((z - c_z) * sz, (y - c_xy) * sy, (x - c_xy) * sx),
             rgb=True,
         )
 
@@ -123,21 +124,49 @@ def _add_sphere_layers(
 def _add_segmentation_layers(
     cells: list[Cell], viewer: napari.Viewer, data_layer: napari.layers.Image
 ):
+    sz, sy, sx = data_layer.scale
     for cell in cells:
         mask = cell.metadata["segmentation_mask"][:, :, :, None]
         mask = np.repeat(mask, 4, axis=3)
+        zcn, ycn, xcn = cell.metadata["segmentation_corner"]
 
         z, y, x = cell.z, cell.y, cell.x
-        center = np.array([z, y, x])
-        offset = center - np.array(mask.shape[:3]) / 2
 
         viewer.add_image(
             mask,
-            name=f"{z}z{y}y{x}x mask",
-            scale=data_layer.scale,
-            translate=offset,
+            name=f"{z}z{y}y{x}x segmentation",
+            scale=(sz, sy, sx),
+            translate=(zcn * sz, ycn * sy, xcn * sx),
             rgb=True,
         )
+
+        for tp, name in (("", "intensity"), ("_shape", "shape")):
+            # convert all to zyx
+            vectors = np.flip(
+                np.array(cell.metadata[f"paor{tp}_xyz_um"]), axis=1
+            )
+            vectors_vox = vectors / [[sz, sy, sx]] * 10
+            centroid = np.array(cell.metadata[f"paor_centroid{tp}_xyz_vox"])[
+                ::-1
+            ]
+
+            lines = [
+                np.array(
+                    [
+                        vectors_vox[ax, :] + centroid,
+                        centroid - vectors_vox[ax, :],
+                    ]
+                )
+                for ax in range(3)
+            ]
+            viewer.add_shapes(
+                lines,
+                name=f"{z}z{y}y{x}x PAOR {name}",
+                shape_type="line",
+                edge_color=["red", "green", "blue"],
+                scale=(sz, sy, sx),
+                edge_width=0.5,
+            )
 
 
 def process_worker_result(

@@ -197,7 +197,7 @@ def _debug_display(
             "{offset:0.2f})^{{2}}}}{{2*{sigma:0.2f}^{{2}}}}}}+{c:0.2f}$"
         ).format(vy=vy, **r_lat_data)
 
-    p_hor = cell.metadata["r_xy"] + r_lat_data["offset"]
+    p_hor = cell.metadata["r_xy_vox"] + r_lat_data["offset"]
     val = _interpolate(lat_line, p_hor, 0)
     ax1.plot(
         [p_hor * vy],
@@ -229,7 +229,7 @@ def _debug_display(
             "{offset:0.2f})^{{2}}}}{{2*{sigma:0.2f}^{{2}}}}}}+{c:0.2f}$"
         ).format(vz=vz, **r_axial_data)
 
-    p_hor = cell.metadata["r_z"] + r_axial_data["offset"]
+    p_hor = cell.metadata["r_z_vox"] + r_axial_data["offset"]
     val = _interpolate(ax_line, p_hor, 0)
     ax2.plot(
         [p_hor * vz],
@@ -456,10 +456,11 @@ def _run_batches(
                     "r_xy_max_std": -1,
                     "r_z_max_std": -1,
                     "segmentation_mask": segmentation_mask[i],
+                    "segmentation_corner": corner,
                     "seg_id": total_cells,
                     "volume_vox": volume[i],
-                    "paor_xyz_vox": paor_vectors_intensity[i],
-                    "paor_shape_xyz_vox": paor_vectors_mask[i],
+                    "paor_xyz_um": paor_vectors_intensity[i],
+                    "paor_shape_xyz_um": paor_vectors_mask[i],
                     "paor_centroid_xyz_vox": [
                         cr + cn
                         for cr, cn in zip(
@@ -708,13 +709,20 @@ def main(
 
     # temporarily remove segmentation mask so it doesn't get saved to yaml
     segmentations = [
-        c.metadata.pop("segmentation_mask", None) for c in dedup_cells
+        (
+            c.metadata.pop("segmentation_mask"),
+            c.metadata.pop("segmentation_corner"),
+        )
+        for c in dedup_cells
     ]
     save_cells(dedup_cells, str(output_cells_path))
     logging.info(f"cell_meta_3d: Analysis took {datetime.now() - ts}")
 
-    for cell, segmentation in zip(dedup_cells, segmentations, strict=False):
+    for cell, (segmentation, corner) in zip(
+        dedup_cells, segmentations, strict=False
+    ):
         cell.metadata["segmentation_mask"] = segmentation
+        cell.metadata["segmentation_corner"] = corner
 
     return dedup_cells
 
