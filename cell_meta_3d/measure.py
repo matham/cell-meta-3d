@@ -1291,7 +1291,6 @@ class CellSizeCalc:
         np.ndarray,
     ]:
         spacing = [self.voxel_size[ax] for ax in xyz_order]
-        cube_voxels = [self.cube_voxels[ax] for ax in xyz_order]
         n = data.shape[0]
         data_arange = np.arange(n)
 
@@ -1301,18 +1300,31 @@ class CellSizeCalc:
         ]
         masked_data = data / cval
         masked_data[np.logical_not(segmentation_mask)] = 0
+
+        # convert to xyz order
         masked_data = np.moveaxis(
             masked_data.astype(np.float64),
             (1, 2, 3),
             [ax + 1 for ax in xyz_order],
         )
-
         segmentation = np.moveaxis(
             segmentation_mask.astype(np.float64),
             (1, 2, 3),
             [ax + 1 for ax in xyz_order],
         )
+        outside_segmentation_mask = np.moveaxis(
+            np.logical_not(segmentation_mask),
+            (1, 2, 3),
+            [ax + 1 for ax in xyz_order],
+        )
 
+        gx, gy, gz = (
+            np.arange(masked_data.shape[1]) * spacing[0],
+            np.arange(masked_data.shape[2]) * spacing[1],
+            np.arange(masked_data.shape[3]) * spacing[2],
+        )
+
+        # these are all in um (spacing) units
         paor_vectors_intensity = np.empty((n, 3, 3))
         paor_centroid_intensity = np.empty((n, 3))
         paor_moment2_intensity = np.empty((n, 3))
@@ -1336,40 +1348,6 @@ class CellSizeCalc:
             paor_moment2_intensity,
             paor_extent_intensity,
         )
-
-        # scales input volume to single voxel being min scale, but the same in
-        # all dims. And add batch
-        min_s = min(spacing)
-        sx, sy, sz = spacing
-        # voxel size will now be smallest voxel scale
-        zoom_mat = np.array(
-            [
-                [sx / min_s, 0, 0, 0],
-                [0, sy / min_s, 0, 0],
-                [0, 0, sz / min_s, 0],
-                [0, 0, 0, 1],
-            ]
-        )[None, :, :]
-        # moves zoomed volume to center of array and add batch dim
-        zoomed_size = int(
-            math.ceil(
-                max(
-                    [
-                        v * s / min_s
-                        for v, s in zip(cube_voxels, spacing, strict=True)
-                    ]
-                )
-            )
-        )
-        # and the size will be the largest dim size for all dims
-        uncenter_mat = np.array(
-            [
-                [1, 0, 0, zoomed_size / 2],
-                [0, 1, 0, zoomed_size / 2],
-                [0, 0, 1, zoomed_size / 2],
-                [0, 0, 0, 1],
-            ]
-        )[None, :, :]
 
         # we calculate the moments of inertia of the cell as well the moments
         # of inertial of the shape of the cell not accounting for the intensity
@@ -1450,60 +1428,24 @@ class CellSizeCalc:
             vectors[...] = eigenvectors
             moment2[...] = eigenvalues
 
-            # each item is 4x4, last column first 3 rows is negative shift
-            # from center. But it is in frame of voxel so divide by input scale
-            center_mat = np.repeat(np.eye(4)[None, :, :], n, axis=0)
-            center_mat[:, :3, 3] = -centroid / [[sx, sy, sz]]
-            # multiply by inverse of the unit vectors to apply negative
-            # angle. eigenvectors start as columns and it's now transposed,
-            # which is the inverse
-            rotate_mat = np.repeat(np.eye(4)[None, :, :], n, axis=0)
-            rotate_mat[:, :3, :3] = eigenvectors
-            # first move volume to center of original axis by given voxels.
-            # Then zoom so each voxel is at the smallest input scale. Then
-            # rotate by unit vectors so cell aligns to xyz axis, and then move
-            # it to the center of output cuboid, which is the size of largest
-            # input dim, but scale is smallest scale for all 3 dims
-            forward_mat = uncenter_mat @ rotate_mat @ zoom_mat @ center_mat
-            # scipy expects the pull matrix of the opposite order so invert
-            # for speed, invert rotation and translation separately
-            inverse_mat = np.zeros_like(forward_mat)
-            # transpose of rotation part
-            inverse_mat[:, :3, :3] = np.linalg.inv(forward_mat[:, :3, :3])
-            inverse_mat[:, :3, 3] = (
-                -inverse_mat[:, :3, :3] @ forward_mat[:, :3, 3][:, :, None]
-            )[:, :, 0]
-            inverse_mat[:, 3, 3] = 1
+            # get um spaced grid centered on centroid
+            gx_centered = gx[None, :] - centroid[:, 0, None]
+            gy_centered = gy[None, :] - centroid[:, 1, None]
+            gz_centered = gz[None, :] - centroid[:, 2, None]
 
-            for i in range(n):
-                # we don't want any smoothing because we just want voxel counts
-                # in um
-                cell_aligned = scipy.ndimage.affine_transform(
-                    volume[i, ...],
-                    inverse_mat[i, :, :],
-                    order=0,
-                    mode="nearest",
-                    output_shape=(zoomed_size, zoomed_size, zoomed_size),
-                    prefilter=False,
-                )
-
-                # now just find containing box to get diameter in each axis
-                xi, yi, zi = np.nonzero(cell_aligned)
-                extent[i, 0, :] = (
-                    zoomed_size / 2 - xi.min(),
-                    xi.max() - zoomed_size / 2,
-                )
-                extent[i, 1, :] = (
-                    zoomed_size / 2 - yi.min(),
-                    yi.max() - zoomed_size / 2,
-                )
-                extent[i, 2, :] = (
-                    zoomed_size / 2 - zi.min(),
-                    zi.max() - zoomed_size / 2,
-                )
-
-            # extent is in units of min scale, convert to micron
-            extent *= min_s
+            for dim in range(3):
+                vec = eigenvectors[:, dim, :]
+                # project x component to eigenvector and expand shape to yz
+                # axes, same for other 2 axes
+                x_comp = (vec[:, 0, None] * gx_centered)[:, :, None, None]
+                y_comp = (vec[:, 1, None] * gy_centered)[:, None, :, None]
+                z_comp = (vec[:, 2, None] * gz_centered)[:, None, None, :]
+                # this is the projection of each point along the current dim
+                # vector. Or the distance along that dim from centroid
+                dim_projection = x_comp + y_comp + z_comp
+                dim_projection[outside_segmentation_mask] = 0
+                extent[:, dim, 0] = np.min(dim_projection, axis=(1, 2, 3))
+                extent[:, dim, 1] = np.max(dim_projection, axis=(1, 2, 3))
 
         # it comes out in units of spacing, convert back to voxels
         paor_centroid_intensity /= spacing
