@@ -145,16 +145,17 @@ def _add_segmentation_layers(
             vectors = np.flip(
                 np.array(cell.metadata[f"paor{tp}_xyz_um"]), axis=1
             )
-            vectors_vox = vectors / [[sz, sy, sx]] * 10
+            vectors_vox = vectors / [[sz, sy, sx]]
             centroid = np.array(cell.metadata[f"paor_centroid{tp}_xyz_vox"])[
                 ::-1
             ]
+            extent = np.array(cell.metadata[f"paor_extent{tp}_um"])
 
             lines = [
                 np.array(
                     [
-                        vectors_vox[ax, :] + centroid,
-                        centroid - vectors_vox[ax, :],
+                        vectors_vox[ax, :] * extent[ax, 1] + centroid,
+                        centroid - vectors_vox[ax, :] * extent[ax, 0],
                     ]
                 )
                 for ax in range(3)

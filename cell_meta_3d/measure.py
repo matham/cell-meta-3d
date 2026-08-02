@@ -103,6 +103,7 @@ class CellSizeCalc:
     decay_gaussian_bounds: Sequence[float]
 
     decay_fraction: float
+    super_pixel: int
 
     # the center of the cube
     cube_center_voxels: np.ndarray
@@ -162,6 +163,7 @@ class CellSizeCalc:
             -1,
             1,
         ),
+        super_pixel: int = 4,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -176,6 +178,7 @@ class CellSizeCalc:
         self.decay_fraction = (
             2 * lateral_decay_fraction + axial_decay_fraction
         ) / 3
+        self.super_pixel = super_pixel
 
         cube_size_um = _expand_num_triplet(cube_size_um)
         self.cube_voxels = _norm_by_size(cube_size_um, voxel_size)
@@ -1263,7 +1266,7 @@ class CellSizeCalc:
                 markers=peak_markers,
                 mask=above_threshold,
                 connectivity=3,
-                compactness=50,
+                compactness=1,
             )
 
             inside = labels == labels[c1, c2, c3]
@@ -1288,16 +1291,9 @@ class CellSizeCalc:
         np.ndarray,
     ]:
         spacing = [self.voxel_size[ax] for ax in xyz_order]
-        sx, sy, sz = spacing
         cube_voxels = [self.cube_voxels[ax] for ax in xyz_order]
-        zoomed_size = int(
-            math.ceil(
-                max(
-                    [v * s for v, s in zip(cube_voxels, spacing, strict=False)]
-                )
-            )
-        )
         n = data.shape[0]
+        data_arange = np.arange(n)
 
         center = center.round().astype(np.intp)
         cval = data[np.arange(n), center[:, 0], center[:, 1], center[:, 2]][
@@ -1320,34 +1316,73 @@ class CellSizeCalc:
         paor_vectors_intensity = np.empty((n, 3, 3))
         paor_centroid_intensity = np.empty((n, 3))
         paor_moment2_intensity = np.empty((n, 3))
-        paor_extent_intensity = np.empty((n, 3))
+        paor_extent_intensity = np.empty((n, 3, 2))
         paor_vectors_mask = np.empty((n, 3, 3))
         paor_centroid_mask = np.empty((n, 3))
         paor_moment2_mask = np.empty((n, 3))
-        paor_extent_mask = np.empty((n, 3))
+        paor_extent_mask = np.empty((n, 3, 2))
+
+        masked_arrays = (
+            masked_data,
+            paor_vectors_mask,
+            paor_centroid_mask,
+            paor_moment2_mask,
+            paor_extent_mask,
+        )
+        intensity_arrays = (
+            segmentation,
+            paor_vectors_intensity,
+            paor_centroid_intensity,
+            paor_moment2_intensity,
+            paor_extent_intensity,
+        )
+
+        # scales input volume to single voxel being min scale, but the same in
+        # all dims. And add batch
+        min_s = min(spacing)
+        sx, sy, sz = spacing
+        # voxel size will now be smallest voxel scale
+        zoom_mat = np.array(
+            [
+                [sx / min_s, 0, 0, 0],
+                [0, sy / min_s, 0, 0],
+                [0, 0, sz / min_s, 0],
+                [0, 0, 0, 1],
+            ]
+        )[None, :, :]
+        # moves zoomed volume to center of array and add batch dim
+        zoomed_size = int(
+            math.ceil(
+                max(
+                    [
+                        v * s / min_s
+                        for v, s in zip(cube_voxels, spacing, strict=True)
+                    ]
+                )
+            )
+        )
+        # and the size will be the largest dim size for all dims
+        uncenter_mat = np.array(
+            [
+                [1, 0, 0, zoomed_size / 2],
+                [0, 1, 0, zoomed_size / 2],
+                [0, 0, 1, zoomed_size / 2],
+                [0, 0, 0, 1],
+            ]
+        )[None, :, :]
 
         # we calculate the moments of inertia of the cell as well the moments
         # of inertial of the shape of the cell not accounting for the intensity
         # at each voxel. Then we transform it to the principal axes of
         # rotation, which is what we want using the inertia
         # eigenvalues/vectors, which are along those axes
-        for i in range(n):
-            for volume, vectors, centroid, moment2, extent in [
-                (
-                    masked_data,
-                    paor_vectors_mask,
-                    paor_centroid_mask,
-                    paor_moment2_mask,
-                    paor_extent_mask,
-                ),
-                (
-                    segmentation,
-                    paor_vectors_intensity,
-                    paor_centroid_intensity,
-                    paor_moment2_intensity,
-                    paor_extent_intensity,
-                ),
-            ]:
+        for volume, vectors, centroid, moment2, extent in (
+            masked_arrays,
+            intensity_arrays,
+        ):
+            central_moments = np.empty((n, 3, 3, 3))
+            for i in range(n):
+                # calculate the moments centroid
                 moments = skimage.measure.moments(
                     volume[i, ...], order=1, spacing=spacing
                 )
@@ -1356,90 +1391,96 @@ class CellSizeCalc:
                 cdz = moments[0, 0, 1] / moments[0, 0, 0]
                 centroid[i, :] = cdx, cdy, cdz
 
-                central_moments = skimage.measure.moments_central(
+                # and then the central moments
+                central_moments[i, :, :, :] = skimage.measure.moments_central(
                     volume[i, ...],
-                    center=[cdx, cdy, cdz],
+                    center=centroid[i, :],
                     order=2,
                     spacing=spacing,
                 )
-                moment_mat = np.array(
-                    [
-                        [
-                            central_moments[2, 0, 0],
-                            central_moments[1, 1, 0],
-                            central_moments[1, 0, 1],
-                        ],
-                        [
-                            central_moments[1, 1, 0],
-                            central_moments[0, 2, 0],
-                            central_moments[0, 1, 1],
-                        ],
-                        [
-                            central_moments[1, 0, 1],
-                            central_moments[0, 1, 1],
-                            central_moments[0, 0, 2],
-                        ],
-                    ]
-                )
 
-                eigenvalues, eigenvectors = np.linalg.eigh(moment_mat)
+            # matrix is nx3x3
+            moment_matrix = central_moments[
+                data_arange[:, None, None],
+                # lines below, each correspond to 1st, 2nd, and 3rd dims of the
+                # 3x3x3 central moment (of a batch item), respectively. For
+                # a given dim, each inner tuple corresponds to a row in the
+                # output 3x3 inertia matrix for a batch item. E.g. (2, 1, 1) is
+                # the 1st row of the output 3x3 and each is the index of the
+                # first dim of the 3x3x3 input
+                (((2, 1, 1), (1, 0, 0), (1, 0, 0)),),
+                (((0, 1, 0), (1, 2, 1), (0, 1, 0)),),
+                (((0, 0, 1), (0, 0, 1), (1, 1, 2)),),
+            ]
 
-                # it's ordered so largest eigenvalue is last and columns are
-                # vectors. We want rows to be vectors and first row largest etc
-                eigenvectors = np.flip(eigenvectors.transpose(), axis=0)
-                eigenvalues = eigenvalues[::-1]
+            eigenvalues, eigenvectors = np.linalg.eigh(moment_matrix)
+            # change from column to row vectors for each batch item
+            eigenvectors = np.swapaxes(eigenvectors, 1, 2)
+            # order from largest to smallest corresponding eigenvalue. eigh
+            # returns smallest to largest for each batch item
+            eigenvectors = np.flip(eigenvectors, axis=1)
+            # same for eigenvalues
+            eigenvalues = np.flip(eigenvalues, axis=1)
 
-                # if last eigenvector is not same direction as cross product,
-                # we need to flip it
-                if not np.allclose(
-                    np.cross(eigenvectors[0, :], eigenvectors[1, :]),
-                    eigenvectors[2, :],
-                ):
-                    eigenvectors[2, :] *= -1
-                assert np.allclose(
-                    np.cross(eigenvectors[0, :], eigenvectors[1, :]),
-                    eigenvectors[2, :],
-                )
+            # if last eigenvector is not same direction as cross product,
+            # we need to flip it
+            is_match = np.isclose(
+                np.cross(
+                    eigenvectors[:, 0, :],
+                    eigenvectors[:, 1, :],
+                    axisa=1,
+                    axisb=1,
+                    axisc=1,
+                ),
+                eigenvectors[:, 2, :],
+            )
+            incorrect_dir = np.logical_not(np.all(is_match, axis=1))
+            eigenvectors[incorrect_dir, 2, :] *= -1
+            assert np.allclose(
+                np.cross(
+                    eigenvectors[:, 0, :],
+                    eigenvectors[:, 1, :],
+                    axisa=1,
+                    axisb=1,
+                    axisc=1,
+                ),
+                eigenvectors[:, 2, :],
+            )
 
-                vectors[i, :] = eigenvectors
-                moment2[i, :] = eigenvalues
+            vectors[...] = eigenvectors
+            moment2[...] = eigenvalues
 
-                center_mat = np.array(
-                    [
-                        [1, 0, 0, -cdx / sx],
-                        [0, 1, 0, -cdy / sy],
-                        [0, 0, 1, -cdz / sz],
-                        [0, 0, 0, 1],
-                    ]
-                )
-                zoom_mat = np.array(
-                    [[sx, 0, 0, 0], [0, sy, 0, 0], [0, 0, sz, 0], [0, 0, 0, 1]]
-                )
-                # multiply by inverse of the unit vectors to apply negative
-                # angle. eigenvectors start as columns and it's now transposed,
-                # which is the inverse
-                rotate_mat = np.eye(4)
-                rotate_mat[:3, :3] = eigenvectors
-                uncenter_mat = np.array(
-                    [
-                        [1, 0, 0, zoomed_size / 2],
-                        [0, 1, 0, zoomed_size / 2],
-                        [0, 0, 1, zoomed_size / 2],
-                        [0, 0, 0, 1],
-                    ]
-                )
-                # first move volume to center of original axis by given voxels.
-                # Then zoom so each voxel is a micron. Then rotate by unit
-                # vectors so cell aligns to xyz axis, and then move it to the
-                # center of output cuboid
-                forward_mat = uncenter_mat @ rotate_mat @ zoom_mat @ center_mat
-                # scipy expects the pull matrix of the opposite order so invert
-                inverse_mat = np.linalg.inv(forward_mat)
+            # each item is 4x4, last column first 3 rows is negative shift
+            # from center. But it is in frame of voxel so divide by input scale
+            center_mat = np.repeat(np.eye(4)[None, :, :], n, axis=0)
+            center_mat[:, :3, 3] = -centroid / [[sx, sy, sz]]
+            # multiply by inverse of the unit vectors to apply negative
+            # angle. eigenvectors start as columns and it's now transposed,
+            # which is the inverse
+            rotate_mat = np.repeat(np.eye(4)[None, :, :], n, axis=0)
+            rotate_mat[:, :3, :3] = eigenvectors
+            # first move volume to center of original axis by given voxels.
+            # Then zoom so each voxel is at the smallest input scale. Then
+            # rotate by unit vectors so cell aligns to xyz axis, and then move
+            # it to the center of output cuboid, which is the size of largest
+            # input dim, but scale is smallest scale for all 3 dims
+            forward_mat = uncenter_mat @ rotate_mat @ zoom_mat @ center_mat
+            # scipy expects the pull matrix of the opposite order so invert
+            # for speed, invert rotation and translation separately
+            inverse_mat = np.zeros_like(forward_mat)
+            # transpose of rotation part
+            inverse_mat[:, :3, :3] = np.linalg.inv(forward_mat[:, :3, :3])
+            inverse_mat[:, :3, 3] = (
+                -inverse_mat[:, :3, :3] @ forward_mat[:, :3, 3][:, :, None]
+            )[:, :, 0]
+            inverse_mat[:, 3, 3] = 1
+
+            for i in range(n):
                 # we don't want any smoothing because we just want voxel counts
                 # in um
                 cell_aligned = scipy.ndimage.affine_transform(
                     volume[i, ...],
-                    inverse_mat,
+                    inverse_mat[i, :, :],
                     order=0,
                     mode="nearest",
                     output_shape=(zoomed_size, zoomed_size, zoomed_size),
@@ -1448,9 +1489,21 @@ class CellSizeCalc:
 
                 # now just find containing box to get diameter in each axis
                 xi, yi, zi = np.nonzero(cell_aligned)
-                extent[i, 0] = xi.max() - xi.min() + 1
-                extent[i, 1] = yi.max() - yi.min() + 1
-                extent[i, 2] = zi.max() - zi.min() + 1
+                extent[i, 0, :] = (
+                    zoomed_size / 2 - xi.min(),
+                    xi.max() - zoomed_size / 2,
+                )
+                extent[i, 1, :] = (
+                    zoomed_size / 2 - yi.min(),
+                    yi.max() - zoomed_size / 2,
+                )
+                extent[i, 2, :] = (
+                    zoomed_size / 2 - zi.min(),
+                    zi.max() - zoomed_size / 2,
+                )
+
+            # extent is in units of min scale, convert to micron
+            extent *= min_s
 
         # it comes out in units of spacing, convert back to voxels
         paor_centroid_intensity /= spacing
