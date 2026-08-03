@@ -10,6 +10,7 @@ import tifffile
 import tqdm
 from brainglobe_utils.cells.cells import Cell
 from brainglobe_utils.IO.cells import get_cells
+from skimage.transform import downscale_local_mean
 
 from cell_meta_3d import __version__
 
@@ -66,10 +67,19 @@ def main(
     cells = sorted(cells, key=lambda c: c.z)
 
     with h5py.File(segmentation_path, "r") as h5_file:
-        intensity_index_dset: h5py.Dataset = h5_file["intensity_index"]
-        intensity_dset: h5py.Dataset = h5_file["intensity"]
+        cube_voxels = [v.item() for v in h5_file.attrs["cube_voxels"]]
+        super_voxel = tuple(v.item() for v in h5_file.attrs["super_voxel"])
+        is_super = any(v != 1 for v in super_voxel)
+        upsampled_cube_voxels = [
+            v * s for v, s in zip(cube_voxels, super_voxel, strict=True)
+        ]
+
+        intensity_index_dset: h5py.Dataset = h5_file[
+            "upsampled_cuboid_intensity_index"
+        ]
+        intensity_dset: h5py.Dataset = h5_file["upsampled_cuboid_intensity"]
         cell_index_range_dset: h5py.Dataset = h5_file["cell_index_range"]
-        cell_corner_dset: h5py.Dataset = h5_file["cell_corner"]
+        cell_corner_dset: h5py.Dataset = h5_file["cell_corner_vox"]
 
         def frames():
             blank = np.zeros(tif_shape[1:], dtype=intensity_dset.dtype)
@@ -95,18 +105,37 @@ def main(
             data_index = cell.metadata["seg_id"]
 
             intensity_s, intensity_e = cell_index_range_dset[data_index, :]
-            corner = cell_corner_dset[data_index, :][None, :]
+            corner = cell_corner_dset[data_index, :]
             intensity_index = np.asarray(
                 intensity_index_dset[intensity_s:intensity_e, :]
             )
-            intensity_index += corner
             intensity = np.asarray(intensity_dset[intensity_s:intensity_e])
 
-            arr[
-                intensity_index[:, 0],
-                intensity_index[:, 1],
-                intensity_index[:, 2],
-            ] = intensity
+            if is_super:
+                block = np.zeros(
+                    upsampled_cube_voxels, dtype=intensity_dset.dtype
+                )
+                block[
+                    intensity_index[:, 0],
+                    intensity_index[:, 1],
+                    intensity_index[:, 2],
+                ] = intensity
+
+                block_downsampled = downscale_local_mean(block, super_voxel)
+
+                assert np.all(np.equal(block_downsampled.shape, cube_voxels))
+                zcr, ycr, xcr = corner
+                zn, yn, xn = cube_voxels
+                arr[zcr : zcr + zn, ycr : ycr + yn, xcr : xcr + xn] = (
+                    block_downsampled
+                )
+            else:
+                intensity_index += corner[None, :]
+                arr[
+                    intensity_index[:, 0],
+                    intensity_index[:, 1],
+                    intensity_index[:, 2],
+                ] = intensity
 
             if (
                 cell.z - last_z > flush_z_freq
