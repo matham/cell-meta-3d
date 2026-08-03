@@ -23,6 +23,7 @@ from cellfinder.core.classify.cube_generator import (
     CuboidBatchSampler,
     get_data_cuboid_range,
 )
+from cellfinder.core.tools.threading import EOFSignal, ThreadWithException
 from fancylog import fancylog
 from torch.utils.data import DataLoader
 
@@ -267,6 +268,7 @@ def create_segmentation_datasets(
     h5_file.attrs["upsampled_voxel_size"] = cell_calc.upsampled_voxel_size
     h5_file.attrs["super_voxel"] = cell_calc.seg_super_voxel
     super_voxel = cell_calc.seg_super_voxel
+    vmax = max(super_voxel)
 
     mask_index_dtype = np.uint16
     if all(
@@ -279,9 +281,11 @@ def create_segmentation_datasets(
         "upsampled_cuboid_intensity_index",
         shape=(0, 3),
         maxshape=(None, 3),
-        chunks=(5 * 5 * 5 * batch_size * 10, 3),
+        chunks=(5 * 5 * 5 * batch_size * vmax * 10, 3),
         dtype=mask_index_dtype,
         compression="gzip",
+        compression_opts=5,
+        shuffle=True,
     )
 
     if signal_array is not None:
@@ -292,9 +296,11 @@ def create_segmentation_datasets(
         "upsampled_cuboid_intensity",
         shape=(0,),
         maxshape=(None,),
-        chunks=(5 * 5 * 5 * batch_size * 10,),
+        chunks=(5 * 5 * 5 * batch_size * vmax * 10,),
         dtype=dtype,
         compression="gzip",
+        compression_opts=5,
+        shuffle=True,
     )
 
     cell_index_range = h5_file.create_dataset(
@@ -303,7 +309,7 @@ def create_segmentation_datasets(
         maxshape=(None, 2),
         chunks=(batch_size * 10, 2),
         dtype=np.int64,
-        # compression="gzip",
+        compression="gzip",
     )
 
     cell_corner = h5_file.create_dataset(
@@ -312,7 +318,7 @@ def create_segmentation_datasets(
         maxshape=(None, 3),
         chunks=(batch_size * 10, 3),
         dtype=np.uint32,
-        # compression="gzip",
+        compression="gzip",
     )
 
     h5_datasets = {
@@ -361,6 +367,18 @@ def append_segmentation_data_h5(
     dset[old_size_batch:, :] = cell_centers_vox - [cube_center_vox]
 
 
+def segmentation_data_worker(
+    thread: ThreadWithException,
+    h5_datasets: dict[str, h5py.Dataset],
+):
+    while True:
+        msg = thread.get_msg_from_mainthread()
+        if msg == EOFSignal:
+            return
+
+        append_segmentation_data_h5(h5_datasets, *msg)
+
+
 def _run_batches(
     data_loader: DataLoader,
     dataset: CellMeasureTiffDataset | CellMeasureStackDataset,
@@ -373,6 +391,7 @@ def _run_batches(
     stop_after_n_cells: int | None,
     add_segmentation_to_metadata: bool,
     status_callback: Callable[[int], None] | None,
+    seg_data_thread: ThreadWithException | None,
 ):
     output_cells = []
     # data order is always z, y, x. Units are voxels
@@ -420,13 +439,16 @@ def _run_batches(
         indices = indices.numpy().astype(int)
 
         if h5_datasets:
-            append_segmentation_data_h5(
-                h5_datasets,
+            args = (
                 segmentation_mask_upsampled,
                 upsampled_data,
                 [cells[point_i] for point_i in indices],
                 (z_center, y_center, x_center),
             )
+            if seg_data_thread is not None:
+                seg_data_thread.send_msg_to_thread(args)
+            else:
+                append_segmentation_data_h5(h5_datasets, *args)
 
         # convert to list so items become native python type
         center = center.tolist()
@@ -696,6 +718,7 @@ def main(
 
     h5_file = None
     h5_datasets = {}
+    seg_data_thread = None
     if segmentation_path:
         segmentation_path = Path(segmentation_path)
         segmentation_path.parent.mkdir(parents=True, exist_ok=True)
@@ -705,28 +728,41 @@ def main(
             cell_calc, points_filenames, signal_array, batch_size, h5_file
         )
 
-    if workers:
-        dataset.start_dataset_thread(workers)
-    try:
-        output_cells = _run_batches(
-            data_loader,
-            dataset,
-            sampler,
-            cell_calc,
-            cells,
-            plot_output_path,
-            debug_data,
-            h5_datasets,
-            stop_after_n_cells,
-            add_segmentation_to_metadata,
-            status_callback,
+        seg_data_thread = ThreadWithException(
+            target=segmentation_data_worker,
+            args=(h5_datasets,),
+            pass_self=True,
         )
-    finally:
+        seg_data_thread.start()
+
+    try:
         try:
-            dataset.stop_dataset_thread()
+            if workers:
+                dataset.start_dataset_thread(workers)
+            try:
+                output_cells = _run_batches(
+                    data_loader,
+                    dataset,
+                    sampler,
+                    cell_calc,
+                    cells,
+                    plot_output_path,
+                    debug_data,
+                    h5_datasets,
+                    stop_after_n_cells,
+                    add_segmentation_to_metadata,
+                    status_callback,
+                    seg_data_thread,
+                )
+            finally:
+                dataset.stop_dataset_thread()
         finally:
-            if h5_file is not None:
-                h5_file.close()
+            if seg_data_thread is not None:
+                seg_data_thread.notify_to_end_thread()
+                seg_data_thread.join()
+    finally:
+        if h5_file is not None:
+            h5_file.close()
 
     # remove duplicate cells - can happen if moving center shifted multiple
     # cells to same center
