@@ -91,15 +91,16 @@ def _add_sphere_layers(
     cells: list[Cell], viewer: napari.Viewer, data_layer: napari.layers.Image
 ):
     sz, sy, sx = data_layer.scale
+    s_lat = (sx + sy) / 2
     for cell in cells:
         z = cell.z
         y = cell.y
         x = cell.x
 
-        r_xy = max(cell.metadata["r_xy_vox"], 1)
-        r_z = max(cell.metadata["r_z_vox"], 1)
-        size_xy = max(int(round(2 * cell.metadata["r_xy_vox"])), 1) + 2
-        size_z = max(int(round(2 * cell.metadata["r_z_vox"])), 1) + 2
+        r_xy = max(cell.metadata["r_xy_um"] / s_lat, 1)
+        r_z = max(cell.metadata["r_z_um"] / sz, 1)
+        size_xy = max(int(round(2 * cell.metadata["r_xy_um"] / s_lat)), 1) + 2
+        size_z = max(int(round(2 * cell.metadata["r_z_um"] / sz)), 1) + 2
         c_xy = size_xy / 2
         c_z = size_z / 2
 
@@ -122,51 +123,64 @@ def _add_sphere_layers(
 
 
 def _add_segmentation_layers(
-    cells: list[Cell], viewer: napari.Viewer, data_layer: napari.layers.Image
+    cells: list[Cell],
+    viewer: napari.Viewer,
+    data_layer: napari.layers.Image,
+    voxel_size: tuple[float, float, float],
 ):
     sz, sy, sx = data_layer.scale
     for cell in cells:
-        mask = cell.metadata["segmentation_mask"][:, :, :, None]
+        seg_data = cell.metadata["segmentation_upsampled"]
+        mask = seg_data["mask"][:, :, :, None]
         mask = np.repeat(mask, 4, axis=3)
-        zcn, ycn, xcn = cell.metadata["segmentation_corner"]
+        zcn, ycn, xcn = (
+            c / s
+            for c, s in zip(seg_data["corner_um"], voxel_size, strict=True)
+        )
 
         z, y, x = cell.z, cell.y, cell.x
 
         viewer.add_image(
             mask,
             name=f"{z}z{y}y{x}x segmentation",
-            scale=(sz, sy, sx),
+            scale=(sz / 4, sy / 4, sx / 4),
             translate=(zcn * sz, ycn * sy, xcn * sx),
             rgb=True,
         )
 
         for tp, name in (("", "intensity"), ("_shape", "shape")):
             # convert all to zyx
-            vectors = np.flip(
+            vectors_um = np.flip(
                 np.array(cell.metadata[f"paor{tp}_xyz_um"]), axis=1
             )
-            vectors_vox = vectors / [[sz, sy, sx]]
-            centroid = np.array(cell.metadata[f"paor_centroid{tp}_xyz_vox"])[
+            vectors_vox = vectors_um / [voxel_size]
+
+            centroid = np.array(cell.metadata[f"paor_centroid{tp}_xyz_um"])[
                 ::-1
             ]
-            extent = np.array(cell.metadata[f"paor_extent{tp}_um"])
+            centroid_vox = centroid / voxel_size
 
+            extent_um = np.array(cell.metadata[f"paor_extent{tp}_um"])
+
+            # vectors_vox * extent_um is vectors_um * extent_um / voxel_size,
+            # which is extent_vector_vox
             lines = [
                 np.array(
                     [
-                        vectors_vox[ax, :] * extent[ax, 1] + centroid,
-                        centroid - vectors_vox[ax, :] * extent[ax, 0],
+                        centroid_vox + vectors_vox[ax, :] * extent_um[ax, 0],
+                        centroid_vox + vectors_vox[ax, :] * extent_um[ax, 1],
                     ]
                 )
                 for ax in range(3)
             ]
+
             viewer.add_shapes(
                 lines,
                 name=f"{z}z{y}y{x}x PAOR {name}",
                 shape_type="line",
                 edge_color=["red", "green", "blue"],
                 scale=(sz, sy, sx),
-                edge_width=0.5,
+                edge_width=0.25,
             )
 
 
@@ -176,12 +190,13 @@ def process_worker_result(
     data_layer: napari.layers.Image,
     add_sphere_layers: bool,
     add_segmentation_layers: bool,
+    voxel_size: tuple[float, float, float],
 ):
     if add_sphere_layers:
         _add_sphere_layers(cells, viewer, data_layer)
 
     if add_segmentation_layers:
-        _add_segmentation_layers(cells, viewer, data_layer)
+        _add_segmentation_layers(cells, viewer, data_layer, voxel_size)
 
 
 def get_heavy_widgets(
@@ -294,15 +309,19 @@ def analyse_widget() -> widgets.Container:
         axial_decay_length: float = 35,
         axial_decay_fraction: float = 1 / math.e,
         axial_decay_algorithm: Literal["gaussian", "manual"] = "gaussian",
-        output_cells_path: Path = None,
+        seg_decay_fraction: float = 1 / math.e,
+        seg_super_voxel: tuple[int, int, int] = (1, 1, 1),
         batch_size: int = 32,
         n_free_cpus: int = 2,
         max_workers: int = 3,
+        output_cells_path: Path = None,
+        segmentation_path: Path | None = None,
         plot_output_path: Path | None = None,
-        add_sphere_layers: bool = False,
-        add_segmentation_layers: bool = False,
+        save_segmentation: bool = False,
         save_plots: bool = False,
         debug_data: bool = False,
+        add_sphere_layers: bool = False,
+        add_segmentation_layers: bool = False,
     ) -> None:
         """
         Run analysis.
@@ -326,6 +345,10 @@ def analyse_widget() -> widgets.Container:
             raise ValueError
         if not save_plots:
             plot_output_path = None
+        if save_segmentation and not segmentation_path:
+            raise ValueError
+        if not save_segmentation:
+            segmentation_path = None
 
         if selected_cells_only:
             selection = np.asarray(list(cell_layer.selected_data))
@@ -353,12 +376,16 @@ def analyse_widget() -> widgets.Container:
             axial_decay_length=axial_decay_length,
             axial_decay_fraction=axial_decay_fraction,
             axial_decay_algorithm=axial_decay_algorithm,
+            seg_decay_fraction=seg_decay_fraction,
+            seg_super_voxel=seg_super_voxel,
             batch_size=batch_size,
             output_cells_path=output_cells_path,
             n_free_cpus=n_free_cpus,
             max_workers=max_workers,
             plot_output_path=plot_output_path,
             debug_data=debug_data,
+            segmentation_path=segmentation_path,
+            add_segmentation_to_metadata=True,
         )
 
         # Make sure if the worker emits an error, it is propagated to this
@@ -372,6 +399,7 @@ def analyse_widget() -> widgets.Container:
                 data_layer=signal_image,
                 add_sphere_layers=add_sphere_layers,
                 add_segmentation_layers=add_segmentation_layers,
+                voxel_size=voxel_size,
             )
         )
 
@@ -383,7 +411,7 @@ def analyse_widget() -> widgets.Container:
         ("Signal image", "Cell layer"),
         ("voxel_size", "voxel_size"),
     )
-    widget.insert(widget.index("output_cells_path") + 1, progress_bar)
+    widget.insert(widget.index("add_segmentation_layers") + 1, progress_bar)
 
     container = widgets.Container(
         widgets=[widget],

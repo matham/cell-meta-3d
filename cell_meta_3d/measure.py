@@ -11,6 +11,7 @@ import skimage
 from cellfinder.core.detect.filters.volume.laplacian_filter import (
     get_27_stencil,
 )
+from scipy.interpolate import RegularGridInterpolator
 from scipy.optimize import curve_fit
 
 _shared_mem_kwargs = {}
@@ -91,6 +92,7 @@ class CellSizeCalc:
     lateral_decay_algorithm: Literal["gaussian", "manual"]
     lateral_decay_len_voxels: int
     lateral_decay_fraction: float
+    lateral_voxel_size: float
 
     axial_intensity_algorithm: Literal[
         "center_line", "volume", "volume_margin"
@@ -99,11 +101,13 @@ class CellSizeCalc:
     axial_decay_algorithm: Literal["gaussian", "manual"]
     axial_decay_len_voxels: int
     axial_decay_fraction: float
+    axial_voxel_size: float
 
     decay_gaussian_bounds: Sequence[float]
 
-    decay_fraction: float
-    super_pixel: int
+    seg_decay_fraction: float
+    seg_super_voxel: tuple[int, int, int]
+    upsampled_voxel_size: tuple[float, float, float]
 
     # the center of the cube
     cube_center_voxels: np.ndarray
@@ -163,7 +167,8 @@ class CellSizeCalc:
             -1,
             1,
         ),
-        super_pixel: int = 4,
+        seg_decay_fraction: float = 1 / math.e,
+        seg_super_voxel: tuple[int, int, int] = (1, 1, 1),
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -175,10 +180,16 @@ class CellSizeCalc:
         self.axial_intensity_algorithm = axial_intensity_algorithm
         self.axial_decay_algorithm = axial_decay_algorithm
         self.axial_decay_fraction = axial_decay_fraction
-        self.decay_fraction = (
-            2 * lateral_decay_fraction + axial_decay_fraction
-        ) / 3
-        self.super_pixel = super_pixel
+        self.seg_decay_fraction = seg_decay_fraction
+        self.seg_super_voxel = tuple(int(round(v)) for v in seg_super_voxel)
+        if any(v < 1 for v in self.seg_super_voxel):
+            raise ValueError(
+                f"super voxel must be at least 1. Got {self.seg_super_voxel}"
+            )
+        self.upsampled_voxel_size = tuple(
+            v / s
+            for v, s in zip(voxel_size, self.seg_super_voxel, strict=False)
+        )
 
         cube_size_um = _expand_num_triplet(cube_size_um)
         self.cube_voxels = _norm_by_size(cube_size_um, voxel_size)
@@ -192,7 +203,9 @@ class CellSizeCalc:
 
         lat_voxels = [r for i, r in enumerate(voxel_size) if i != axial_dim]
         lat_vox = sum(lat_voxels) / 2
+        self.lateral_voxel_size = lat_vox
         axial_vox = voxel_size[axial_dim]
+        self.axial_voxel_size = axial_vox
 
         self.lateral_max_radius_voxels = int(
             round(lateral_max_radius_um / lat_vox)
@@ -342,6 +355,9 @@ class CellSizeCalc:
         np.ndarray,
         np.ndarray,
         np.ndarray,
+        np.ndarray,
+        np.ndarray,
+        np.ndarray,
     ]:
         """
         Ideally, we would shift the center by the amount estimate during
@@ -350,7 +366,8 @@ class CellSizeCalc:
 
         :param data: Shape is 4D: batch, and the 3 data dims in the same order
             as the input parameters (e.g. `voxel_size`).
-        :return:
+        :return: Other than center, everything spatial is in um units (or
+        provided voxel sizes).
         """
         if len(data.shape) != 4:
             # batch dim is first
@@ -377,6 +394,7 @@ class CellSizeCalc:
             self.lateral_decay_algorithm,
             self.lateral_decay_fraction,
             self.lateral_decay_len_voxels + 1,
+            self.lateral_voxel_size,
         )
 
         # get the intensity decay line from the center in the axial direction
@@ -396,15 +414,22 @@ class CellSizeCalc:
             self.axial_decay_algorithm,
             self.axial_decay_fraction,
             self.axial_decay_len_voxels + 1,
+            self.axial_voxel_size,
         )
 
         center_values = self.get_center_values(data, center)
         data_min = np.min(data, axis=(1, 2, 3))
         segmentation_intensity_threshold = self.get_segmentation_threshold(
-            data, data_min, center, center_values, self.decay_fraction
+            data, data_min, center, center_values, self.seg_decay_fraction
         )
-        segmentation_mask = self.get_segmentation_mask(
+
+        if any(v != 1 for v in self.seg_super_voxel):
+            upsampled_data = self.upsample_volume(data)
+        else:
+            upsampled_data = data
+        segmentation_mask_upsampled = self.get_segmentation_mask(
             data,
+            upsampled_data,
             data_min,
             center,
             segmentation_intensity_threshold,
@@ -421,9 +446,10 @@ class CellSizeCalc:
             paor_moment2_mask,
             paor_extent_mask,
         ) = self.get_segmentation_vectors(
-            data,
-            center,
-            segmentation_mask,
+            upsampled_data,
+            center_values,
+            segmentation_mask_upsampled,
+            self.upsampled_voxel_size,
             (2, 1, 0),
         )
 
@@ -435,7 +461,10 @@ class CellSizeCalc:
             r_axial,
             ax_line,
             r_axial_params,
-            segmentation_mask,
+            upsampled_data,
+            center_values,
+            data_min,
+            segmentation_mask_upsampled,
             paor_vectors_intensity,
             paor_centroid_intensity,
             paor_moment2_intensity,
@@ -452,6 +481,7 @@ class CellSizeCalc:
         algorithm: Literal["gaussian", "manual"],
         fraction: float,
         len_voxels: int,
+        voxel_size: float,
     ) -> tuple[np.ndarray, np.ndarray | None]:
         params_arr = None
         r_arr = np.empty(len(line), dtype=np.float64)
@@ -465,6 +495,7 @@ class CellSizeCalc:
                         line[i, :],
                         fraction,
                         len_voxels,
+                        voxel_size,
                         *self.decay_gaussian_bounds,
                     )
                     r_arr[i] = r
@@ -474,6 +505,7 @@ class CellSizeCalc:
                     line,
                     fraction,
                     len_voxels,
+                    voxel_size,
                 )
                 r_arr[:] = r
             case _:
@@ -1078,6 +1110,7 @@ class CellSizeCalc:
         data: np.ndarray,
         decay_fraction: float,
         max_n: int,
+        voxel_size: float,
         min_scale: float = 0.1,
         max_scale: float = 1.0,
         left_max_offset: float = -0.25,
@@ -1141,13 +1174,18 @@ class CellSizeCalc:
             r = math.sqrt(temp) + offset
 
         # r is relative to "offset" from center
-        return r, [a, offset, sigma, c], perr.tolist()
+        return (
+            r * voxel_size,
+            [a, offset * voxel_size, sigma * voxel_size, c],
+            perr.tolist(),
+        )
 
     def get_radius_from_decay(
         self,
         data: np.ndarray,
         decay_fraction: float,
         max_n: int,
+        voxel_size: float,
     ) -> np.ndarray:
         data = data[:, :max_n]
 
@@ -1155,11 +1193,12 @@ class CellSizeCalc:
         has_max = np.any(less_mask, axis=1)
 
         r = np.where(has_max, np.argmax(less_mask, axis=1), -1)
-        return r
+        return r * voxel_size
 
     def get_center_values(
         self, data: np.ndarray, center: np.ndarray
     ) -> np.ndarray:
+        center = center.round().astype(np.intp)
         return data[
             np.arange(data.shape[0]), center[:, 0], center[:, 1], center[:, 2]
         ]
@@ -1219,27 +1258,85 @@ class CellSizeCalc:
 
         return threshold
 
+    @cached_property
+    def cube_voxel_coords_um(
+        self,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        v1, v2, v3 = self.voxel_size
+        s1, s2, s3 = self.cube_voxels
+
+        return np.arange(s1) * v1, np.arange(s2) * v2, np.arange(s3) * v3
+
+    @cached_property
+    def upsampled_grid_um(self) -> list[np.ndarray]:
+        v1, v2, v3 = self.upsampled_voxel_size
+        s1, s2, s3 = self.cube_voxels
+        sv1, sv2, sv3 = self.seg_super_voxel
+
+        coord = (
+            np.arange(s1 * sv1) * v1,
+            np.arange(s2 * sv2) * v2,
+            np.arange(s3 * sv3) * v3,
+        )
+        return np.meshgrid(*coord, indexing="ij")
+
+    def upsample_volume(
+        self,
+        data: np.ndarray,
+    ) -> np.ndarray:
+        grid_input = self.cube_voxel_coords_um
+        grid_output = self.upsampled_grid_um
+
+        # it expects batch dim last
+        interpolator = RegularGridInterpolator(
+            grid_input,
+            np.moveaxis(data, (0, 1, 2, 3), (3, 0, 1, 2)),
+            method="linear",
+            bounds_error=False,
+            fill_value=0,
+        )
+
+        # must be a tuple input for some reason
+        upsampled_data = interpolator((*grid_output,))
+        upsampled_data = np.moveaxis(
+            upsampled_data, (0, 1, 2, 3), (1, 2, 3, 0)
+        )
+        return upsampled_data
+
     def get_segmentation_mask(
         self,
         data: np.ndarray,
+        upsampled_data: np.ndarray,
         global_min_data: np.ndarray,
         center: np.ndarray,
         threshold: np.ndarray,
         kernel: np.ndarray,
     ):
+        # we only use the upsampled data for watershed. For finding max and min
+        # peaks with use the original sized data. Upsampling messes with
+        # max/min peaks but definitely with the laplacian filter
         n = data.shape[0]
-        above_threshold_data = data > threshold[:, None, None, None]
+        super_voxel = self.seg_super_voxel
+        above_threshold_up_data = (
+            upsampled_data > threshold[:, None, None, None]
+        )
         laplacian_data = scipy.ndimage.convolve(
             data, kernel, axes=(1, 2, 3), mode="nearest"
         )
-        segmentation_mask = np.empty(data.shape, dtype=bool)
+        segmentation_mask_up = np.empty(
+            above_threshold_up_data.shape, dtype=bool
+        )
 
         for i in range(n):
             item_data = data[i, ...]
-            c1, c2, c3 = center[i]
-            above_threshold = above_threshold_data[i, ...]
+            item_data_up = upsampled_data[i, ...]
+            # convert center to upsampled volume
+            c1, c2, c3 = center[i] * super_voxel
+            above_threshold_up = above_threshold_up_data[i, ...]
 
-            local_max_mask = np.zeros(item_data.shape, dtype=bool)
+            # find peaks in original data, but fill in those locations in the
+            # upsampled size
+            local_max_mask_up = np.zeros(item_data_up.shape, dtype=bool)
 
             local_max_coords = skimage.feature.peak_local_max(
                 item_data,
@@ -1247,8 +1344,10 @@ class CellSizeCalc:
                 exclude_border=False,
                 num_peaks_per_label=1,
             )
-            local_max_mask[tuple(local_max_coords.T)] = True
-            local_max_mask[c1, c2, c3] = True
+            local_max_mask_up[tuple((local_max_coords * [super_voxel]).T)] = (
+                True
+            )
+            local_max_mask_up[c1, c2, c3] = True
 
             local_max_coords = skimage.feature.peak_local_max(
                 laplacian_data[i, ...],
@@ -1256,29 +1355,34 @@ class CellSizeCalc:
                 exclude_border=False,
                 num_peaks_per_label=1,
             )
-            local_max_mask[tuple(local_max_coords.T)] = True
+            local_max_mask_up[tuple((local_max_coords * [super_voxel]).T)] = (
+                True
+            )
 
             peak_markers = skimage.measure.label(
-                local_max_mask, connectivity=2
+                local_max_mask_up, connectivity=2
             )
             labels = skimage.segmentation.watershed(
-                -(item_data - global_min_data[i]),
+                -(item_data_up - global_min_data[i]),
                 markers=peak_markers,
-                mask=above_threshold,
+                mask=above_threshold_up,
                 connectivity=3,
                 compactness=1,
             )
 
             inside = labels == labels[c1, c2, c3]
-            segmentation_mask[i, ...] = np.logical_and(above_threshold, inside)
+            segmentation_mask_up[i, ...] = np.logical_and(
+                above_threshold_up, inside
+            )
 
-        return segmentation_mask
+        return segmentation_mask_up
 
     def get_segmentation_vectors(
         self,
         data: np.ndarray,
-        center: np.ndarray,
+        center_values: np.ndarray,
         segmentation_mask: np.ndarray,
+        spacing: tuple[float, float, float],
         xyz_order: tuple[int, int, int],
     ) -> tuple[
         np.ndarray,
@@ -1290,15 +1394,11 @@ class CellSizeCalc:
         np.ndarray,
         np.ndarray,
     ]:
-        spacing = [self.voxel_size[ax] for ax in xyz_order]
+        spacing = [spacing[ax] for ax in xyz_order]
         n = data.shape[0]
         data_arange = np.arange(n)
 
-        center = center.round().astype(np.intp)
-        cval = data[np.arange(n), center[:, 0], center[:, 1], center[:, 2]][
-            :, None, None, None
-        ]
-        masked_data = data / cval
+        masked_data = data / center_values[:, None, None, None]
         masked_data[np.logical_not(segmentation_mask)] = 0
 
         # convert to xyz order
@@ -1446,10 +1546,6 @@ class CellSizeCalc:
                 dim_projection[outside_segmentation_mask] = 0
                 extent[:, dim, 0] = np.min(dim_projection, axis=(1, 2, 3))
                 extent[:, dim, 1] = np.max(dim_projection, axis=(1, 2, 3))
-
-        # it comes out in units of spacing, convert back to voxels
-        paor_centroid_intensity /= spacing
-        paor_centroid_mask /= spacing
 
         # the moments themselves (eigenvalues) stay in units of spacing
         return (

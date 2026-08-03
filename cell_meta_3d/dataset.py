@@ -57,7 +57,10 @@ class CellMeasureDatasetBase:
             r_axial,
             ax_line,
             r_axial_params,
-            segmentation_mask,
+            upsampled_data,
+            intensity,
+            min_intensity,
+            segmentation_mask_upsampled,
             paor_vectors_intensity,
             paor_centroid_intensity,
             paor_moment2_intensity,
@@ -67,12 +70,6 @@ class CellMeasureDatasetBase:
             paor_moment2_mask,
             paor_extent_mask,
         ) = cell_calc(np_data)
-
-        # get the center intensity of the points
-        intensity = np_data[
-            np.arange(len(np_data)), center[:, 0], center[:, 1], center[:, 2]
-        ]
-        min_intensity = np.min(np_data, axis=(1, 2, 3))
 
         arrays = (
             center,
@@ -92,7 +89,8 @@ class CellMeasureDatasetBase:
                 if r_axial_params is None
                 else rfn.structured_to_unstructured(r_axial_params)
             ),
-            segmentation_mask,
+            upsampled_data,
+            segmentation_mask_upsampled,
             paor_vectors_intensity,
             paor_centroid_intensity,
             paor_moment2_intensity,
@@ -106,8 +104,6 @@ class CellMeasureDatasetBase:
         arrays = tuple(
             torch.from_numpy(arr).to(device=data.device) for arr in arrays
         )
-        arrays = *arrays, data[..., 0]
-
         return arrays
 
 

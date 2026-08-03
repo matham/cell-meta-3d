@@ -148,10 +148,29 @@ def cell_meta_3d_parser() -> ArgumentParser:
         default=[0.1, 1, -0.25, 3, 0.1, 10.0, -1, 1],
     )
     parser.add_argument(
+        "--seg-decay-fraction",
+        dest="seg_decay_fraction",
+        type=partial(check_positive_float, none_allowed=False),
+        default=1 / math.e,
+    )
+    parser.add_argument(
+        "--seg-super-voxel",
+        dest="seg_super_voxel",
+        nargs=3,
+        type=partial(check_positive_int, none_allowed=False),
+        default=[1, 1, 1],
+    )
+    parser.add_argument(
         "--batch-size",
         dest="batch_size",
         type=partial(check_positive_int, none_allowed=False),
         default=32,
+    )
+    parser.add_argument(
+        "--stop-after-n-cells",
+        dest="stop_after_n_cells",
+        type=partial(check_positive_int, none_allowed=True),
+        default=None,
     )
     parser.add_argument(
         "--n-free-cpus",
