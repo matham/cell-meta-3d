@@ -295,6 +295,8 @@ def analyse_widget() -> widgets.Container:
         lateral_decay_fraction={"max": 1, "step": 0.0001},
         axial_decay_fraction={"max": 1, "step": 0.0001},
         plot_output_path={"mode": "d"},
+        output_cells_path={"mode": "w"},
+        segmentation_path={"mode": "w"},
         call_button=True,
         persist=True,
     )

@@ -194,7 +194,7 @@ def _debug_display(
         model_label = None
 
         func = (
-            "\n${a:0.2f}*e^{{-\\frac{{(\\frac{{r_um}}-"
+            "\n${a:0.2f}*e^{{-\\frac{{(r-"
             "{offset:0.2f})^{{2}}}}{{2*{sigma:0.2f}^{{2}}}}}}+{c:0.2f}$"
         ).format(**r_lat_data)
 
@@ -226,7 +226,7 @@ def _debug_display(
         )
 
         func = (
-            "\n${a:0.2f}*e^{{-\\frac{{(\\frac{{r}}-"
+            "\n${a:0.2f}*e^{{-\\frac{{(r-"
             "{offset:0.2f})^{{2}}}}{{2*{sigma:0.2f}^{{2}}}}}}+{c:0.2f}$"
         ).format(**r_axial_data)
 
@@ -494,7 +494,7 @@ def _run_batches(
                     "r_xy_um_max_std": -1,
                     "r_z_um_max_std": -1,
                     "seg_id": total_cells,
-                    "volume_um3": volume[i],
+                    "paor_volume_um3": volume[i],
                     "paor_xyz_um": paor_vectors_intensity[i],
                     "paor_shape_xyz_um": paor_vectors_mask[i],
                     "paor_centroid_xyz_um": [
