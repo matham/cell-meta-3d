@@ -127,6 +127,7 @@ def _add_segmentation_layers(
     viewer: napari.Viewer,
     data_layer: napari.layers.Image,
     voxel_size: tuple[float, float, float],
+    seg_super_voxel: tuple[int, int, int],
 ):
     sz, sy, sx = data_layer.scale
     for cell in cells:
@@ -143,7 +144,11 @@ def _add_segmentation_layers(
         viewer.add_image(
             mask,
             name=f"{z}z{y}y{x}x segmentation",
-            scale=(sz / 4, sy / 4, sx / 4),
+            scale=(
+                sz / seg_super_voxel[0],
+                sy / seg_super_voxel[1],
+                sx / seg_super_voxel[2],
+            ),
             translate=(zcn * sz, ycn * sy, xcn * sx),
             rgb=True,
         )
@@ -191,12 +196,15 @@ def process_worker_result(
     add_sphere_layers: bool,
     add_segmentation_layers: bool,
     voxel_size: tuple[float, float, float],
+    seg_super_voxel: tuple[int, int, int],
 ):
     if add_sphere_layers:
         _add_sphere_layers(cells, viewer, data_layer)
 
     if add_segmentation_layers:
-        _add_segmentation_layers(cells, viewer, data_layer, voxel_size)
+        _add_segmentation_layers(
+            cells, viewer, data_layer, voxel_size, seg_super_voxel
+        )
 
 
 def get_heavy_widgets(
@@ -400,6 +408,7 @@ def analyse_widget() -> widgets.Container:
                 add_sphere_layers=add_sphere_layers,
                 add_segmentation_layers=add_segmentation_layers,
                 voxel_size=voxel_size,
+                seg_super_voxel=seg_super_voxel,
             )
         )
 
