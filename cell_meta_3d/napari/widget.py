@@ -321,6 +321,7 @@ def analyse_widget() -> widgets.Container:
         axial_decay_algorithm: Literal["gaussian", "manual"] = "gaussian",
         seg_decay_fraction: float = 1 / math.e,
         seg_super_voxel: tuple[int, int, int] = (1, 1, 1),
+        seg_padding_factor: float = 0.0,
         batch_size: int = 32,
         n_free_cpus: int = 2,
         max_workers: int = 3,
@@ -396,6 +397,7 @@ def analyse_widget() -> widgets.Container:
             debug_data=debug_data,
             segmentation_path=segmentation_path,
             add_segmentation_to_metadata=True,
+            seg_padding_factor=seg_padding_factor,
         )
 
         # Make sure if the worker emits an error, it is propagated to this

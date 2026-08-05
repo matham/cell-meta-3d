@@ -321,11 +321,21 @@ def create_segmentation_datasets(
         compression="gzip",
     )
 
+    cuboid_voxels = h5_file.create_dataset(
+        "upsampled_cuboid_voxels",
+        shape=(0, 3),
+        maxshape=(None, 3),
+        chunks=(batch_size * 10, 3),
+        dtype=np.uint32,
+        compression="gzip",
+    )
+
     h5_datasets = {
         "cell_index_range": cell_index_range,
         "intensity": intensity,
         "intensity_index": intensity_index,
         "cell_corner": cell_corner,
+        "cuboid_voxels": cuboid_voxels,
     }
 
     return h5_datasets
@@ -337,6 +347,7 @@ def append_segmentation_data_h5(
     upsampled_raw_intensity: np.ndarray,
     cells: list[Cell],
     cube_center_vox: tuple[int, int, int],
+    slice_offset: np.ndarray,
 ):
     n = upsampled_segmentation_mask.shape[0]
     old_size_flat = len(h5_datasets["intensity"])
@@ -364,7 +375,15 @@ def append_segmentation_data_h5(
     dset = h5_datasets["cell_corner"]
     dset.resize(old_size_batch + n, axis=0)
     cell_centers_vox = np.array([[c.z, c.y, c.x] for c in cells])
-    dset[old_size_batch:, :] = cell_centers_vox - [cube_center_vox]
+    # shift each item index from cell center to the corner of the overall cube
+    cell_centers_vox -= [cube_center_vox]
+    # move corner to offset where the upsampled cube actually starts
+    cell_centers_vox += [slice_offset]
+    dset[old_size_batch:, :] = cell_centers_vox
+
+    dset = h5_datasets["cuboid_voxels"]
+    dset.resize(old_size_batch + n, axis=0)
+    dset[old_size_batch:, :] = [upsampled_segmentation_mask.shape[1:]]
 
 
 def segmentation_data_worker(
@@ -426,6 +445,7 @@ def _run_batches(
             axial_params_data,
             upsampled_data,
             segmentation_mask_upsampled,
+            slice_offset,
             paor_vectors_intensity,
             paor_centroid_intensity,
             paor_moment2_intensity,
@@ -442,8 +462,11 @@ def _run_batches(
             args = (
                 segmentation_mask_upsampled,
                 upsampled_data,
+                # we use the original cells because we want the location of the
+                # cuboid that was computed before we shifted to a new center
                 [cells[point_i] for point_i in indices],
-                (z_center, y_center, x_center),
+                [z_center, y_center, x_center],
+                slice_offset,
             )
             if seg_data_thread is not None:
                 seg_data_thread.send_msg_to_thread(args)
@@ -452,6 +475,7 @@ def _run_batches(
 
         # convert to list so items become native python type
         center = center.tolist()
+        slice_offset = slice_offset.tolist()
         center_intensity = center_intensity.tolist()
         min_intensity = min_intensity.tolist()
         r_lat = r_lat.tolist()
@@ -475,6 +499,12 @@ def _run_batches(
             corner = cell.z - z_center, cell.y - y_center, cell.x - x_center
             corner_um = [
                 c * vx for c, vx in zip(corner, vox_size, strict=True)
+            ]
+            slice_corner_um = [
+                c + u * vx
+                for c, u, vx in zip(
+                    corner_um, slice_offset, vox_size, strict=True
+                )
             ]
 
             z, y, x = center[i]
@@ -523,7 +553,7 @@ def _run_batches(
                 cell.metadata["segmentation_upsampled"] = {
                     "mask": segmentation_mask_upsampled[i],
                     "intensity": upsampled_data[i],
-                    "corner_um": corner_um,
+                    "corner_um": slice_corner_um,
                     "upsampled_voxel_size": up_vox_size,
                 }
 
@@ -626,6 +656,7 @@ def main(
     debug_data: bool = False,
     status_callback: Callable[[int], None] | None = None,
     add_segmentation_to_metadata: bool = False,
+    seg_padding_factor: float = 0.0,
 ) -> list[Cell]:
     """
     We expect the input data to have dimension order of z, y, x. All the
@@ -696,6 +727,7 @@ def main(
         decay_gaussian_bounds=decay_gaussian_bounds,
         seg_decay_fraction=seg_decay_fraction,
         seg_super_voxel=seg_super_voxel,
+        seg_padding_factor=seg_padding_factor,
     )
 
     logging.info(f"cell_meta_3d: Starting analysis of {len(cells)} cells")
@@ -838,6 +870,7 @@ def run_main():
         plot_output_path=args.plot_output_path,
         segmentation_path=args.segmentation_path,
         debug_data=args.debug_data,
+        seg_padding_factor=args.seg_padding_factor,
     )
 
 

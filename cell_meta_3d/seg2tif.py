@@ -67,12 +67,8 @@ def main(
     cells = sorted(cells, key=lambda c: c.z)
 
     with h5py.File(segmentation_path, "r") as h5_file:
-        cube_voxels = [v.item() for v in h5_file.attrs["cube_voxels"]]
         super_voxel = tuple(v.item() for v in h5_file.attrs["super_voxel"])
         is_super = any(v != 1 for v in super_voxel)
-        upsampled_cube_voxels = [
-            v * s for v, s in zip(cube_voxels, super_voxel, strict=True)
-        ]
 
         intensity_index_dset: h5py.Dataset = h5_file[
             "upsampled_cuboid_intensity_index"
@@ -80,6 +76,7 @@ def main(
         intensity_dset: h5py.Dataset = h5_file["upsampled_cuboid_intensity"]
         cell_index_range_dset: h5py.Dataset = h5_file["cell_index_range"]
         cell_corner_dset: h5py.Dataset = h5_file["cell_corner_vox"]
+        cuboid_voxels_dset: h5py.Dataset = h5_file["upsampled_cuboid_voxels"]
 
         def frames():
             blank = np.zeros(tif_shape[1:], dtype=intensity_dset.dtype)
@@ -107,14 +104,14 @@ def main(
             intensity_s, intensity_e = cell_index_range_dset[data_index, :]
             corner = cell_corner_dset[data_index, :]
             intensity_index = np.asarray(
-                intensity_index_dset[intensity_s:intensity_e, :]
+                intensity_index_dset[intensity_s:intensity_e, :], dtype=np.intp
             )
             intensity = np.asarray(intensity_dset[intensity_s:intensity_e])
 
             if is_super:
-                block = np.zeros(
-                    upsampled_cube_voxels, dtype=intensity_dset.dtype
-                )
+                cuboid_voxels = cuboid_voxels_dset[i, :]
+                down_sampled_cuboid_voxels = cuboid_voxels // super_voxel
+                block = np.zeros(cuboid_voxels, dtype=intensity_dset.dtype)
                 block[
                     intensity_index[:, 0],
                     intensity_index[:, 1],
@@ -123,9 +120,13 @@ def main(
 
                 block_downsampled = downscale_local_mean(block, super_voxel)
 
-                assert np.all(np.equal(block_downsampled.shape, cube_voxels))
+                assert np.all(
+                    np.equal(
+                        block_downsampled.shape, cuboid_voxels / super_voxel
+                    )
+                )
                 zcr, ycr, xcr = corner
-                zn, yn, xn = cube_voxels
+                zn, yn, xn = down_sampled_cuboid_voxels
                 arr[zcr : zcr + zn, ycr : ycr + yn, xcr : xcr + xn] = (
                     block_downsampled
                 )

@@ -173,6 +173,12 @@ def cell_meta_3d_parser() -> ArgumentParser:
         default=None,
     )
     parser.add_argument(
+        "--seg-padding-factor",
+        dest="seg_padding_factor",
+        type=partial(check_positive_float, none_allowed=True),
+        default=0.0,
+    )
+    parser.add_argument(
         "--n-free-cpus",
         dest="n_free_cpus",
         type=partial(check_positive_int, none_allowed=False),
