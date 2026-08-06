@@ -381,6 +381,7 @@ class CellSizeCalc:
             raise ValueError
         # get the 3d indices of the (better) cube centers
         center = self.find_pos_center_max(data)
+        center = self.move_center_to_middle_saturated(center, data)
 
         # get the intensity decay line from the center in the lateral direction
         match self.lateral_intensity_algorithm:
@@ -689,6 +690,25 @@ class CellSizeCalc:
                 ]
 
         return centers
+
+    def move_center_to_middle_saturated(
+        self, center: np.ndarray, data: np.ndarray
+    ) -> np.ndarray:
+        fixed_center = center.copy()
+        for i in range(center.shape[0]):
+            mask = skimage.morphology.flood(
+                data[i, ...],
+                tuple(center[i, :]),
+                footprint=None,
+                connectivity=None,
+                tolerance=None,
+            )
+            d1i, d2i, d3i = np.nonzero(mask)
+            fixed_center[i, :] = np.round(
+                np.mean([d1i, d2i, d3i], axis=1)
+            ).astype(np.intp)
+
+        return fixed_center
 
     def _verify_lateral_parameters(self):
         center_offsets = [
@@ -1445,7 +1465,6 @@ class CellSizeCalc:
             local_max_mask_up[tuple((local_max_coords * [super_voxel]).T)] = (
                 True
             )
-            local_max_mask_up[c1, c2, c3] = True
 
             local_max_coords = skimage.feature.peak_local_max(
                 laplacian_data[i, ...],
@@ -1456,6 +1475,16 @@ class CellSizeCalc:
             local_max_mask_up[tuple((local_max_coords * [super_voxel]).T)] = (
                 True
             )
+
+            saturation_mask = skimage.morphology.flood(
+                item_data_up,
+                (c1, c2, c3),
+                footprint=None,
+                connectivity=None,
+                tolerance=2,
+            )
+            local_max_mask_up[saturation_mask] = False
+            local_max_mask_up[c1, c2, c3] = True
 
             peak_markers = skimage.measure.label(
                 local_max_mask_up, connectivity=2
