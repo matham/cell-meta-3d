@@ -345,7 +345,7 @@ def create_segmentation_datasets(
 def append_segmentation_data_h5(
     h5_datasets: dict[str, h5py.Dataset],
     upsampled_segmentation_mask: np.ndarray,
-    upsampled_raw_intensity: np.ndarray,
+    upsampled_raw_intensity_flat: np.ndarray,
     cells: list[Cell],
     cube_center_vox: tuple[int, int, int],
     slice_offset: np.ndarray,
@@ -363,9 +363,8 @@ def append_segmentation_data_h5(
     dset[old_size_flat:, 2] = xi
 
     dset = h5_datasets["intensity"]
-    flat = upsampled_raw_intensity[upsampled_segmentation_mask]
-    dset.resize(old_size_flat + len(flat), axis=0)
-    dset[old_size_flat:] = flat
+    dset.resize(old_size_flat + len(upsampled_raw_intensity_flat), axis=0)
+    dset[old_size_flat:] = upsampled_raw_intensity_flat
 
     dset = h5_datasets["cell_index_range"]
     dset.resize(old_size_batch + n, axis=0)
@@ -435,10 +434,9 @@ def _run_batches(
         i for i, name in enumerate(axial_params_names) if name.endswith("std")
     ]
 
+    progress_bar = tqdm.tqdm(total=len(sampler), smoothing=0)
     total_cells = 0
-    for batch, indices in tqdm.tqdm(
-        data_loader, total=len(data_loader), smoothing=0
-    ):
+    for batch, indices in data_loader:
         # data comes in as batches of torch tensors
         (
             center,
@@ -468,7 +466,7 @@ def _run_batches(
         if h5_datasets:
             args = (
                 segmentation_mask_upsampled,
-                upsampled_data,
+                upsampled_data[segmentation_mask_upsampled],
                 # we use the original cells because we want the location of the
                 # cuboid that was computed before we shifted to a new center
                 [cells[point_i] for point_i in indices],
@@ -618,8 +616,12 @@ def _run_batches(
         if status_callback is not None:
             status_callback(total_cells)
 
+        progress_bar.update()
+
         if stop_after_n_cells and total_cells >= stop_after_n_cells:
             break
+
+    progress_bar.close()
 
     return output_cells
 
