@@ -158,7 +158,7 @@ def run_main():
         z, y, x = map(int, args.tif_shape.split(","))
     else:
         with h5py.File(segmentation_path, "r") as h5_file:
-            zs, ys, xs = [v.item() for v in h5_file.attrs["cube_voxels"]]
+            zs, ys, xs = [v.item() * 2 for v in h5_file.attrs["cube_voxels"]]
 
         z = y = x = 0
         for cell in cells:

@@ -381,6 +381,9 @@ class CellSizeCalc:
             raise ValueError
         # get the 3d indices of the (better) cube centers
         center = self.find_pos_center_max(data)
+        center_values = self.get_center_values(data, center)
+        # the averaging of saturated points might shift to not be right on top
+        # of actual max value
         center = self.move_center_to_middle_saturated(center, data)
 
         # get the intensity decay line from the center in the lateral direction
@@ -423,7 +426,6 @@ class CellSizeCalc:
             self.axial_voxel_size,
         )
 
-        center_values = self.get_center_values(data, center)
         data_min = np.min(data, axis=(1, 2, 3))
         segmentation_intensity_threshold = self.get_segmentation_threshold(
             data, data_min, center, center_values, self.seg_decay_fraction
@@ -691,22 +693,30 @@ class CellSizeCalc:
 
         return centers
 
+    @cached_property
+    def center_saturation_footprint(self) -> np.ndarray:
+        return scipy.ndimage.generate_binary_structure(3, 1)
+
     def move_center_to_middle_saturated(
         self, center: np.ndarray, data: np.ndarray
     ) -> np.ndarray:
         fixed_center = center.copy()
+        # it's inclusive start and end
+        s1, s2, s3 = self._center_search_start[0, :]
+        e1, e2, e3 = self._center_search_end[0, :]
+
         for i in range(center.shape[0]):
             mask = skimage.morphology.flood(
-                data[i, ...],
-                tuple(center[i, :]),
-                footprint=None,
+                data[i, ...][s1 : e1 + 1, s2 : e2 + 1, s3 : e3 + 1],
+                tuple(center[i, :] - [s1, s2, s3]),
+                footprint=self.center_saturation_footprint,
                 connectivity=None,
                 tolerance=None,
             )
             d1i, d2i, d3i = np.nonzero(mask)
             fixed_center[i, :] = np.round(
                 np.mean([d1i, d2i, d3i], axis=1)
-            ).astype(np.intp)
+            ).astype(np.intp) + [s1, s2, s3]
 
         return fixed_center
 
@@ -730,21 +740,16 @@ class CellSizeCalc:
         for c, c_offset, size in zip(
             center, center_offsets, sizes, strict=True
         ):
-            # last element exclusive of the center
-            right = c + c_offset + r
-            # same - first element exclusive of the center
-            left = c - c_offset - r
-
             # don't need to check for decay because decay <= r
-            # number of elements is center plus r
-            if right >= size:
+            # number of elements is center plus r, similarly for offset
+            if c + c_offset + r >= size:
                 raise ValueError(
                     f"Requested lateral line with size {r} voxels and "
                     f"potential center offset of {c_offset} voxels from "
                     f"the center at {c}. This is "
                     f"larger than the size of the cube {size} voxels"
                 )
-            if left < 0:
+            if c - c_offset - r < 0:
                 raise ValueError(
                     f"Requested lateral line with size {r} voxels and "
                     f"potential center offset of negative {c_offset} voxels "
@@ -766,21 +771,16 @@ class CellSizeCalc:
                 f" voxels"
             )
 
-        # number of elements inclusive of the center
-        right = size - (c + c_offset)
-        # same - number of elements inclusive of the center
-        left = c - c_offset + 1
-
         # don't need to check for decay because decay <= r
-        # number of elements is center plus r
-        if right + r >= size:
+        # number of elements is center plus r, similarly for offset
+        if c + c_offset + r >= size:
             raise ValueError(
                 f"Requested axial line with size {r} voxels and "
                 f"potential center offset of {c_offset} voxels from "
                 f"the center at {c}. This is "
                 f"larger than the size of the cube {size} voxels"
             )
-        if left - r < 0:
+        if c - c_offset - r < 0:
             raise ValueError(
                 f"Requested axial line with size {r} voxels and "
                 f"potential center offset of negative {c_offset} voxels "

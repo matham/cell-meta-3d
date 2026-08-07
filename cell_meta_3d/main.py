@@ -155,6 +155,7 @@ def _get_dataset(
         batch_size=None,
         num_workers=workers,
         worker_init_fn=_set_torch_threads,
+        in_order=False,
     )
 
     return data_loader, dataset, sampler, workers
@@ -171,7 +172,6 @@ def _debug_display(
 ) -> None:
     fig, (ax1, ax2) = plt.subplots(1, 2)
 
-    z, y, x = cell.z, cell.y, cell.x
     vz, vy, vx = cell_calc.voxel_size
     r_lat_data = {k: v for k, v in r_lat_data.items() if not k.endswith("std")}
     r_axial_data = {
@@ -249,7 +249,8 @@ def _debug_display(
     fig.subplots_adjust(bottom=0.22)
 
     if plot_output_path:
-        name = f"radius_cell_z{z:05}y{y:05}x{x:05}.jpg"
+        x, y, z = cell.metadata["center_xyz_um"]
+        name = f"radius_cell_z{z:05}y{y:05}x{x:05}um.jpg"
         fig.savefig(plot_output_path / name, dpi=300)
         plt.close(fig)
     else:
@@ -348,6 +349,7 @@ def append_segmentation_data_h5(
     cells: list[Cell],
     cube_center_vox: tuple[int, int, int],
     slice_offset: np.ndarray,
+    voxel_size: tuple[float, float, float],
 ):
     n = upsampled_segmentation_mask.shape[0]
     old_size_flat = len(h5_datasets["intensity"])
@@ -374,7 +376,10 @@ def append_segmentation_data_h5(
 
     dset = h5_datasets["cell_corner"]
     dset.resize(old_size_batch + n, axis=0)
-    cell_centers_vox = np.array([[c.z, c.y, c.x] for c in cells])
+    cell_centers_vox = np.round(
+        np.array([c.metadata["center_xyz_um"][::-1] for c in cells])
+        / [voxel_size]
+    ).astype(np.intp)
     # shift each item index from cell center to the corner of the overall cube
     cell_centers_vox -= [cube_center_vox]
     # move corner to offset where the upsampled cube actually starts
@@ -431,7 +436,9 @@ def _run_batches(
     ]
 
     total_cells = 0
-    for batch, indices in tqdm.tqdm(data_loader, total=len(data_loader)):
+    for batch, indices in tqdm.tqdm(
+        data_loader, total=len(data_loader), smoothing=0
+    ):
         # data comes in as batches of torch tensors
         (
             center,
@@ -467,6 +474,7 @@ def _run_batches(
                 [cells[point_i] for point_i in indices],
                 [z_center, y_center, x_center],
                 slice_offset,
+                vox_size,
             )
             if seg_data_thread is not None:
                 seg_data_thread.send_msg_to_thread(args)
@@ -507,18 +515,27 @@ def _run_batches(
                 )
             ]
 
-            z, y, x = center[i]
-            # shift pos by the amount it shifted from center
-            cell.z = corner[0] + z
-            cell.y = corner[1] + y
-            cell.x = corner[2] + x
+            cell.z, cell.y, cell.x = [
+                int(round((cr + cn) / vx))
+                for cr, cn, vx in zip(
+                    corner_um,
+                    paor_centroid_intensity[i][::-1],
+                    vox_size,
+                    strict=True,
+                )
+            ]
 
+            local_center = [
+                (cr + c) * vx
+                for cr, c, vx in zip(corner, center[i], vox_size, strict=False)
+            ]
             if not hasattr(cell, "metadata"):
                 cell.metadata = {}
             cell.metadata.update(
                 {
                     "intensity": center_intensity[i],
                     "min_intensity": min_intensity[i],
+                    "center_xyz_um": local_center,
                     "r_xy_um": r_lat[i],
                     "r_z_um": r_axial[i],
                     "r_xy_um_max_std": -1,
@@ -801,7 +818,10 @@ def main(
     dedup_cells = []
     seen = set()
     for cell in output_cells:
-        key = cell.x, cell.y, cell.z
+        zyx = cell.metadata["center_xyz_um"][::-1]
+        key = tuple(
+            int(round(p / v)) for p, v in zip(zyx, voxel_size, strict=False)
+        )
         if key in seen:
             continue
 

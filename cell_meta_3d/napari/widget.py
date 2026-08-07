@@ -88,14 +88,16 @@ class Worker(WorkerBase):
 
 
 def _add_sphere_layers(
-    cells: list[Cell], viewer: napari.Viewer, data_layer: napari.layers.Image
+    cells: list[Cell],
+    viewer: napari.Viewer,
+    data_layer: napari.layers.Image,
+    voxel_size: tuple[float, float, float],
 ):
     sz, sy, sx = data_layer.scale
     s_lat = (sx + sy) / 2
     for cell in cells:
-        z = cell.z
-        y = cell.y
-        x = cell.x
+        zyx = cell.metadata["center_xyz_um"][::-1]
+        z, y, x = [p / v for p, v in zip(zyx, voxel_size, strict=False)]
 
         r_xy = max(cell.metadata["r_xy_um"] / s_lat, 1)
         r_z = max(cell.metadata["r_z_um"] / sz, 1)
@@ -139,11 +141,9 @@ def _add_segmentation_layers(
             for c, s in zip(seg_data["corner_um"], voxel_size, strict=True)
         )
 
-        z, y, x = cell.z, cell.y, cell.x
-
         viewer.add_image(
             mask,
-            name=f"{z}z{y}y{x}x segmentation",
+            name="segmentation",
             scale=(
                 sz / seg_super_voxel[0],
                 sy / seg_super_voxel[1],
@@ -181,7 +181,7 @@ def _add_segmentation_layers(
 
             viewer.add_shapes(
                 lines,
-                name=f"{z}z{y}y{x}x PAOR {name}",
+                name=f"PAOR {name}",
                 shape_type="line",
                 edge_color=["red", "green", "blue"],
                 scale=(sz, sy, sx),
