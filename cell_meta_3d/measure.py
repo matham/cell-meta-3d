@@ -342,28 +342,7 @@ class CellSizeCalc:
     def laplacian_kernel(self):
         return get_27_stencil(self.voxel_size)
 
-    def __call__(self, data: np.ndarray) -> tuple[
-        np.ndarray,
-        np.ndarray,
-        np.ndarray,
-        np.ndarray | None,
-        np.ndarray,
-        np.ndarray,
-        np.ndarray | None,
-        np.ndarray,
-        np.ndarray,
-        np.ndarray,
-        np.ndarray,
-        np.ndarray,
-        np.ndarray,
-        np.ndarray,
-        np.ndarray,
-        np.ndarray,
-        np.ndarray,
-        np.ndarray,
-        np.ndarray,
-        np.ndarray,
-    ]:
+    def __call__(self, data: np.ndarray) -> dict[str, np.ndarray | None]:
         """
         Ideally, we would shift the center by the amount estimate during
         radius estimation (e.g. with Gaussian), but currently we don't know
@@ -452,7 +431,7 @@ class CellSizeCalc:
         else:
             sliced_upsampled_data = sliced_data
 
-        sliced_segmentation_mask_upsampled = self.get_segmentation_mask(
+        sliced_seg_mask_upsampled = self.get_segmentation_mask(
             sliced_data,
             sliced_upsampled_data,
             sliced_center,
@@ -472,34 +451,34 @@ class CellSizeCalc:
         ) = self.get_segmentation_vectors(
             sliced_upsampled_data,
             center_values,
-            sliced_segmentation_mask_upsampled,
+            sliced_seg_mask_upsampled,
             self.upsampled_voxel_size,
             slice_start * self.voxel_size,
             (2, 1, 0),
         )
 
-        return (
-            center,
-            r_lat,
-            lat_line,
-            r_lat_params,
-            r_axial,
-            ax_line,
-            r_axial_params,
-            sliced_upsampled_data,
-            center_values,
-            data_min,
-            sliced_segmentation_mask_upsampled,
-            slice_start,
-            paor_vectors_intensity,
-            paor_centroid_intensity,
-            paor_moment2_intensity,
-            paor_extent_intensity,
-            paor_vectors_mask,
-            paor_centroid_mask,
-            paor_moment2_mask,
-            paor_extent_mask,
-        )
+        return {
+            "center": center,
+            "r_lat": r_lat,
+            "lat_line": lat_line,
+            "r_lat_params": r_lat_params,
+            "r_axial": r_axial,
+            "ax_line": ax_line,
+            "r_axial_params": r_axial_params,
+            "sliced_upsampled_data": sliced_upsampled_data,
+            "center_values": center_values,
+            "data_min": data_min,
+            "sliced_segmentation_mask_upsampled": sliced_seg_mask_upsampled,
+            "slice_start": slice_start,
+            "paor_vectors_intensity": paor_vectors_intensity,
+            "paor_centroid_intensity": paor_centroid_intensity,
+            "paor_moment2_intensity": paor_moment2_intensity,
+            "paor_extent_intensity": paor_extent_intensity,
+            "paor_vectors_mask": paor_vectors_mask,
+            "paor_centroid_mask": paor_centroid_mask,
+            "paor_moment2_mask": paor_moment2_mask,
+            "paor_extent_mask": paor_extent_mask,
+        }
 
     def _get_decay_radius(
         self,

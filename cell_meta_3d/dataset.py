@@ -1,3 +1,4 @@
+import math
 from typing import Union
 
 import numpy as np
@@ -48,60 +49,88 @@ class CellMeasureDatasetBase:
         # remove channel dim because we just have data for the signal channel
         np_data = data[..., 0].numpy()
         cell_calc = self.cell_calc
-        # process batch of the cubes and get back their measured data
-        (
-            center,
-            r_lat,
-            lat_line,
-            r_lat_params,
-            r_axial,
-            ax_line,
-            r_axial_params,
-            upsampled_data,
-            intensity,
-            min_intensity,
-            segmentation_mask_upsampled,
-            slice_offset,
-            paor_vectors_intensity,
-            paor_centroid_intensity,
-            paor_moment2_intensity,
-            paor_extent_intensity,
-            paor_vectors_mask,
-            paor_centroid_mask,
-            paor_moment2_mask,
-            paor_extent_mask,
-        ) = cell_calc(np_data)
 
-        arrays = (
-            center,
-            intensity,
-            min_intensity,
-            r_lat,
-            lat_line,
-            (
-                np.array([])
-                if r_lat_params is None
-                else rfn.structured_to_unstructured(r_lat_params)
-            ),
-            r_axial,
-            ax_line,
-            (
-                np.array([])
-                if r_axial_params is None
-                else rfn.structured_to_unstructured(r_axial_params)
-            ),
-            upsampled_data,
-            segmentation_mask_upsampled,
-            slice_offset,
-            paor_vectors_intensity,
-            paor_centroid_intensity,
-            paor_moment2_intensity,
-            paor_extent_intensity,
-            paor_vectors_mask,
-            paor_centroid_mask,
-            paor_moment2_mask,
-            paor_extent_mask,
+        keys = (
+            "center",
+            "r_lat",
+            "lat_line",
+            "r_lat_params",
+            "r_axial",
+            "ax_line",
+            "r_axial_params",
+            "center_values",
+            "data_min",
+            "paor_vectors_intensity",
+            "paor_centroid_intensity",
+            "paor_moment2_intensity",
+            "paor_extent_intensity",
+            "paor_vectors_mask",
+            "paor_centroid_mask",
+            "paor_moment2_mask",
+            "paor_extent_mask",
         )
+        data_keys = (
+            "slice_start",
+            "sliced_upsampled_shape",
+            "sliced_upsampled_flat_data",
+            "sliced_seg_mask_upsampled_flat_idx",
+            "sliced_upsampled_n_non_zeros",
+        )
+
+        sub_size = 16
+        micro_batches = {k: [] for k in keys + data_keys}
+        n = np_data.shape[0]
+        total = 0
+        for i in range(int(math.ceil(n / sub_size))):
+            # process batch of the cubes and get back their measured data
+            res_data = cell_calc(
+                np_data[i * sub_size : (i + 1) * sub_size, ...]
+            )
+            for key, arr in res_data.items():
+                # could be none for params that are available only if selected
+                if arr is None or key not in keys or key in data_keys:
+                    continue
+
+                if arr.dtype.names is not None:
+                    arr = rfn.structured_to_unstructured(arr)
+
+                micro_batches[key].append(arr)
+
+            # flatten out the intensity values to not copy the full cube
+            mask = res_data["sliced_segmentation_mask_upsampled"]
+            intensity = res_data["sliced_upsampled_data"]
+            micro_n = mask.shape[0]
+
+            # needs batch dim
+            micro_batches["slice_start"].append(
+                np.repeat(res_data["slice_start"][None, :], micro_n, axis=0)
+            )
+            micro_batches["sliced_upsampled_shape"].append(
+                np.repeat([mask.shape[1:]], micro_n, axis=0)
+            )
+            micro_batches["sliced_upsampled_flat_data"].append(intensity[mask])
+
+            bi, d1i, d2i, d3i = np.nonzero(mask)
+            bi += total
+            mask_i = np.array([bi, d1i, d2i, d3i], dtype=np.intp).transpose()
+            micro_batches["sliced_seg_mask_upsampled_flat_idx"].append(mask_i)
+
+            non_zero_counts = mask.reshape((n, -1)).sum(axis=1)
+            micro_batches["sliced_upsampled_n_non_zeros"].append(
+                non_zero_counts
+            )
+
+            total += micro_n
+
+        assert total == n
+
+        arrays = []
+        for key in keys + data_keys:
+            item_arrays = micro_batches[key]
+            if len(item_arrays):
+                arrays.append(np.concatenate(item_arrays, axis=0))
+            else:
+                arrays.append(np.array([]))
 
         arrays = tuple(
             torch.from_numpy(arr).to(device=data.device) for arr in arrays

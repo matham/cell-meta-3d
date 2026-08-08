@@ -344,34 +344,41 @@ def create_segmentation_datasets(
 
 def append_segmentation_data_h5(
     h5_datasets: dict[str, h5py.Dataset],
-    upsampled_segmentation_mask: np.ndarray,
-    upsampled_raw_intensity_flat: np.ndarray,
+    sliced_upsampled_n_non_zeros: np.ndarray,
+    sliced_seg_mask_upsampled_flat_idx: np.ndarray,
+    sliced_upsampled_flat_data: np.ndarray,
+    slice_start: np.ndarray,
+    sliced_upsampled_shape: np.ndarray,
     cells: list[Cell],
     cube_center_vox: tuple[int, int, int],
-    slice_offset: np.ndarray,
     voxel_size: tuple[float, float, float],
 ):
-    n = upsampled_segmentation_mask.shape[0]
+    assert len(sliced_upsampled_flat_data) == len(
+        sliced_seg_mask_upsampled_flat_idx
+    )
+    assert len(sliced_upsampled_flat_data) == np.sum(
+        sliced_upsampled_n_non_zeros
+    )
+
+    n = sliced_upsampled_n_non_zeros.shape[0]
+    n_flat = len(sliced_seg_mask_upsampled_flat_idx)
     old_size_flat = len(h5_datasets["intensity"])
     old_size_batch = len(h5_datasets["cell_index_range"])
 
     dset = h5_datasets["intensity_index"]
-    _, zi, yi, xi = np.nonzero(upsampled_segmentation_mask)
-    dset.resize(old_size_flat + len(zi), axis=0)
-    dset[old_size_flat:, 0] = zi
-    dset[old_size_flat:, 1] = yi
-    dset[old_size_flat:, 2] = xi
+    dset.resize(old_size_flat + n_flat, axis=0)
+    dset[old_size_flat:, :] = sliced_seg_mask_upsampled_flat_idx[:, 1:]
 
     dset = h5_datasets["intensity"]
-    dset.resize(old_size_flat + len(upsampled_raw_intensity_flat), axis=0)
-    dset[old_size_flat:] = upsampled_raw_intensity_flat
+    dset.resize(old_size_flat + n_flat, axis=0)
+    dset[old_size_flat:] = sliced_upsampled_flat_data
 
     dset = h5_datasets["cell_index_range"]
     dset.resize(old_size_batch + n, axis=0)
-    counts = upsampled_segmentation_mask.reshape((n, -1)).sum(axis=1)
-    ends = np.cumsum(counts) + old_size_flat
-    dset[old_size_batch:, 0] = ends - counts
-    dset[old_size_batch:, 1] = ends
+    counts = sliced_upsampled_n_non_zeros
+    starts = np.cumsum(counts) - counts + old_size_flat
+    dset[old_size_batch:, 0] = starts
+    dset[old_size_batch:, 1] = starts + counts
 
     dset = h5_datasets["cell_corner"]
     dset.resize(old_size_batch + n, axis=0)
@@ -382,12 +389,12 @@ def append_segmentation_data_h5(
     # shift each item index from cell center to the corner of the overall cube
     cell_centers_vox -= [cube_center_vox]
     # move corner to offset where the upsampled cube actually starts
-    cell_centers_vox += [slice_offset]
+    cell_centers_vox += slice_start
     dset[old_size_batch:, :] = cell_centers_vox
 
     dset = h5_datasets["cuboid_voxels"]
     dset.resize(old_size_batch + n, axis=0)
-    dset[old_size_batch:, :] = [upsampled_segmentation_mask.shape[1:]]
+    dset[old_size_batch:, :] = sliced_upsampled_shape
 
 
 def segmentation_data_worker(
@@ -440,17 +447,14 @@ def _run_batches(
         # data comes in as batches of torch tensors
         (
             center,
-            center_intensity,
-            min_intensity,
             r_lat,
             lat_line,
             lat_params_data,
             r_axial,
             ax_line,
             axial_params_data,
-            upsampled_data,
-            segmentation_mask_upsampled,
-            slice_offset,
+            center_intensity,
+            min_intensity,
             paor_vectors_intensity,
             paor_centroid_intensity,
             paor_moment2_intensity,
@@ -459,19 +463,30 @@ def _run_batches(
             paor_centroid_mask,
             paor_moment2_mask,
             paor_extent_mask,
+            slice_start,
+            sliced_upsampled_shape,
+            sliced_upsampled_flat_data,
+            sliced_seg_mask_upsampled_flat_idx,
+            sliced_upsampled_n_non_zeros,
         ) = [item.numpy() for item in batch]
         center = np.round(center).astype(int)
         indices = indices.numpy().astype(int)
+        sliced_upsampled_start_non_zeros = np.cumulative_sum(
+            sliced_upsampled_n_non_zeros
+        )
+        sliced_upsampled_start_non_zeros -= sliced_upsampled_n_non_zeros
 
         if h5_datasets:
             args = (
-                segmentation_mask_upsampled,
-                upsampled_data[segmentation_mask_upsampled],
+                sliced_upsampled_n_non_zeros,
+                sliced_seg_mask_upsampled_flat_idx,
+                sliced_upsampled_flat_data,
+                slice_start,
+                sliced_upsampled_shape,
                 # we use the original cells because we want the location of the
                 # cuboid that was computed before we shifted to a new center
                 [cells[point_i] for point_i in indices],
                 [z_center, y_center, x_center],
-                slice_offset,
                 vox_size,
             )
             if seg_data_thread is not None:
@@ -481,7 +496,7 @@ def _run_batches(
 
         # convert to list so items become native python type
         center = center.tolist()
-        slice_offset = slice_offset.tolist()
+        slice_start = slice_start.tolist()
         center_intensity = center_intensity.tolist()
         min_intensity = min_intensity.tolist()
         r_lat = r_lat.tolist()
@@ -496,9 +511,7 @@ def _run_batches(
         paor_centroid_mask = paor_centroid_mask.tolist()
         paor_moment2_mask = paor_moment2_mask.tolist()
         paor_extent_mask = paor_extent_mask.tolist()
-        volume = (
-            np.sum(segmentation_mask_upsampled, axis=(1, 2, 3)) * up_vox_vol
-        ).tolist()
+        volume = (sliced_upsampled_n_non_zeros * up_vox_vol).tolist()
 
         for i, point_i in enumerate(indices):
             cell = deepcopy(cells[point_i])
@@ -509,7 +522,7 @@ def _run_batches(
             slice_corner_um = [
                 c + u * vx
                 for c, u, vx in zip(
-                    corner_um, slice_offset, vox_size, strict=True
+                    corner_um, slice_start[i], vox_size, strict=True
                 )
             ]
 
@@ -565,9 +578,32 @@ def _run_batches(
             total_cells += 1
 
             if add_segmentation_to_metadata:
+                volume = np.zeros(
+                    sliced_upsampled_shape[i],
+                    dtype=sliced_upsampled_flat_data.dtype,
+                )
+                mask = np.zeros(sliced_upsampled_shape[i], dtype=bool)
+
+                item_s = sliced_upsampled_start_non_zeros[i]
+                item_e = item_s + sliced_upsampled_n_non_zeros[i]
+                non_zeros_idx = sliced_seg_mask_upsampled_flat_idx[
+                    item_s:item_e, 1:
+                ]
+                values = sliced_upsampled_flat_data[item_s:item_e]
+
+                mask[
+                    non_zeros_idx[:, 0],
+                    non_zeros_idx[:, 1],
+                    non_zeros_idx[:, 2],
+                ] = True
+                volume[
+                    non_zeros_idx[:, 0],
+                    non_zeros_idx[:, 1],
+                    non_zeros_idx[:, 2],
+                ] = values
                 cell.metadata["segmentation_upsampled"] = {
-                    "mask": segmentation_mask_upsampled[i],
-                    "intensity": upsampled_data[i],
+                    "mask": mask,
+                    "intensity": volume,
                     "corner_um": slice_corner_um,
                     "upsampled_voxel_size": up_vox_size,
                 }

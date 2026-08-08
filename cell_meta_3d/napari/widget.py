@@ -199,7 +199,7 @@ def process_worker_result(
     seg_super_voxel: tuple[int, int, int],
 ):
     if add_sphere_layers:
-        _add_sphere_layers(cells, viewer, data_layer)
+        _add_sphere_layers(cells, viewer, data_layer, voxel_size)
 
     if add_segmentation_layers:
         _add_segmentation_layers(
