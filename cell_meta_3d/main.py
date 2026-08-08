@@ -318,7 +318,7 @@ def create_segmentation_datasets(
         shape=(0, 3),
         maxshape=(None, 3),
         chunks=(batch_size * 10, 3),
-        dtype=np.uint32,
+        dtype=np.int64,
         compression="gzip",
     )
 
@@ -327,7 +327,7 @@ def create_segmentation_datasets(
         shape=(0, 3),
         maxshape=(None, 3),
         chunks=(batch_size * 10, 3),
-        dtype=np.uint32,
+        dtype=np.uint16,
         compression="gzip",
     )
 
@@ -347,11 +347,8 @@ def append_segmentation_data_h5(
     sliced_upsampled_n_non_zeros: np.ndarray,
     sliced_seg_mask_upsampled_flat_idx: np.ndarray,
     sliced_upsampled_flat_data: np.ndarray,
-    slice_start: np.ndarray,
+    slice_upsample_corner_vox: np.ndarray,
     sliced_upsampled_shape: np.ndarray,
-    cells: list[Cell],
-    cube_center_vox: tuple[int, int, int],
-    voxel_size: tuple[float, float, float],
 ):
     assert len(sliced_upsampled_flat_data) == len(
         sliced_seg_mask_upsampled_flat_idx
@@ -382,15 +379,7 @@ def append_segmentation_data_h5(
 
     dset = h5_datasets["cell_corner"]
     dset.resize(old_size_batch + n, axis=0)
-    cell_centers_vox = np.round(
-        np.array([c.metadata["center_xyz_um"][::-1] for c in cells])
-        / [voxel_size]
-    ).astype(np.intp)
-    # shift each item index from cell center to the corner of the overall cube
-    cell_centers_vox -= [cube_center_vox]
-    # move corner to offset where the upsampled cube actually starts
-    cell_centers_vox += slice_start
-    dset[old_size_batch:, :] = cell_centers_vox
+    dset[old_size_batch:, :] = slice_upsample_corner_vox
 
     dset = h5_datasets["cuboid_voxels"]
     dset.resize(old_size_batch + n, axis=0)
@@ -476,24 +465,6 @@ def _run_batches(
         )
         sliced_upsampled_start_non_zeros -= sliced_upsampled_n_non_zeros
 
-        if h5_datasets:
-            args = (
-                sliced_upsampled_n_non_zeros,
-                sliced_seg_mask_upsampled_flat_idx,
-                sliced_upsampled_flat_data,
-                slice_start,
-                sliced_upsampled_shape,
-                # we use the original cells because we want the location of the
-                # cuboid that was computed before we shifted to a new center
-                [cells[point_i] for point_i in indices],
-                [z_center, y_center, x_center],
-                vox_size,
-            )
-            if seg_data_thread is not None:
-                seg_data_thread.send_msg_to_thread(args)
-            else:
-                append_segmentation_data_h5(h5_datasets, *args)
-
         # convert to list so items become native python type
         center = center.tolist()
         slice_start = slice_start.tolist()
@@ -513,6 +484,7 @@ def _run_batches(
         paor_extent_mask = paor_extent_mask.tolist()
         volume = (sliced_upsampled_n_non_zeros * up_vox_vol).tolist()
 
+        data_slice_corner_um = []
         for i, point_i in enumerate(indices):
             cell = deepcopy(cells[point_i])
             corner = cell.z - z_center, cell.y - y_center, cell.x - x_center
@@ -525,6 +497,7 @@ def _run_batches(
                     corner_um, slice_start[i], vox_size, strict=True
                 )
             ]
+            data_slice_corner_um.append(slice_corner_um)
 
             cell.z, cell.y, cell.x = [
                 int(round((cr + cn) / vx))
@@ -546,7 +519,7 @@ def _run_batches(
                 {
                     "intensity": center_intensity[i],
                     "min_intensity": min_intensity[i],
-                    "center_xyz_um": local_center,
+                    "center_xyz_um": local_center[::-1],
                     "r_xy_um": r_lat[i],
                     "r_z_um": r_axial[i],
                     "r_xy_um_max_std": -1,
@@ -648,6 +621,21 @@ def _run_batches(
                     plot_output_path,
                     cell_calc,
                 )
+
+        if h5_datasets:
+            args = (
+                sliced_upsampled_n_non_zeros,
+                sliced_seg_mask_upsampled_flat_idx,
+                sliced_upsampled_flat_data,
+                np.round(np.array(data_slice_corner_um) / [vox_size]).astype(
+                    np.intp
+                ),
+                sliced_upsampled_shape,
+            )
+            if seg_data_thread is not None:
+                seg_data_thread.send_msg_to_thread(args)
+            else:
+                append_segmentation_data_h5(h5_datasets, *args)
 
         if status_callback is not None:
             status_callback(total_cells)
@@ -847,6 +835,7 @@ def main(
             if seg_data_thread is not None:
                 seg_data_thread.notify_to_end_thread()
                 seg_data_thread.join()
+                seg_data_thread.clear_remaining()
     finally:
         if h5_file is not None:
             h5_file.close()

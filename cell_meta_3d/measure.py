@@ -1302,8 +1302,8 @@ class CellSizeCalc:
                 tolerance=None,
             )
             d1i, d2i, d3i = np.nonzero(mask)
-            start[i, :] = np.min([d1i, d2i, d3i])
-            end[i, :] = np.max([d1i, d2i, d3i])
+            start[i, :] = np.min([d1i, d2i, d3i], axis=1)
+            end[i, :] = np.max([d1i, d2i, d3i], axis=1)
 
         min_start = start.min(axis=0)
         max_end = end.max(axis=0)

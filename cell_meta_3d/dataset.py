@@ -115,7 +115,7 @@ class CellMeasureDatasetBase:
             mask_i = np.array([bi, d1i, d2i, d3i], dtype=np.intp).transpose()
             micro_batches["sliced_seg_mask_upsampled_flat_idx"].append(mask_i)
 
-            non_zero_counts = mask.reshape((n, -1)).sum(axis=1)
+            non_zero_counts = mask.reshape((micro_n, -1)).sum(axis=1)
             micro_batches["sliced_upsampled_n_non_zeros"].append(
                 non_zero_counts
             )

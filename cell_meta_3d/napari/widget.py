@@ -6,6 +6,7 @@ from functools import partial
 from pathlib import Path
 from typing import Any, Literal
 
+import h5py
 import napari
 import napari.layers
 import numpy as np
@@ -189,6 +190,62 @@ def _add_segmentation_layers(
             )
 
 
+def _add_seg_layers_from_h5(
+    cells: list[Cell],
+    viewer: napari.Viewer,
+    data_layer: napari.layers.Image,
+    segmentation_path: Path,
+):
+    with h5py.File(segmentation_path, "r") as h5_file:
+        super_voxel = tuple(v.item() for v in h5_file.attrs["super_voxel"])
+        intensity_index_dset: h5py.Dataset = h5_file[
+            "upsampled_cuboid_intensity_index"
+        ]
+        intensity_dset: h5py.Dataset = h5_file["upsampled_cuboid_intensity"]
+        cell_index_range_dset: h5py.Dataset = h5_file["cell_index_range"]
+        cell_corner_dset: h5py.Dataset = h5_file["cell_corner_vox"]
+        cuboid_voxels_dset: h5py.Dataset = h5_file["upsampled_cuboid_voxels"]
+
+        for cell in cells:
+            data_index = cell.metadata["seg_id"]
+
+            intensity_s, intensity_e = cell_index_range_dset[data_index, :]
+            corner = cell_corner_dset[data_index, :]
+            intensity_index = np.asarray(
+                intensity_index_dset[intensity_s:intensity_e, :], dtype=np.intp
+            )
+            intensity = np.asarray(intensity_dset[intensity_s:intensity_e])
+            cuboid_voxels = cuboid_voxels_dset[data_index, :]
+
+            volume = np.zeros(cuboid_voxels, dtype=intensity.dtype)
+            volume[
+                intensity_index[:, 0],
+                intensity_index[:, 1],
+                intensity_index[:, 2],
+            ] = intensity
+
+            seg_data = cell.metadata["segmentation_upsampled"]
+            mask = seg_data["mask"][:, :, :, None]
+            mask = np.repeat(mask, 4, axis=3)
+
+            offset = [
+                c * s for c, s in zip(corner, data_layer.scale, strict=True)
+            ]
+
+            viewer.add_image(
+                mask,
+                name="h5 segmentation",
+                scale=[
+                    s / sv
+                    for s, sv in zip(
+                        data_layer.scale, super_voxel, strict=False
+                    )
+                ],
+                translate=offset,
+                rgb=True,
+            )
+
+
 def process_worker_result(
     cells: list[Cell],
     viewer: napari.Viewer,
@@ -197,6 +254,8 @@ def process_worker_result(
     add_segmentation_layers: bool,
     voxel_size: tuple[float, float, float],
     seg_super_voxel: tuple[int, int, int],
+    add_seg_layers_from_h5: bool,
+    segmentation_path: Path | None,
 ):
     if add_sphere_layers:
         _add_sphere_layers(cells, viewer, data_layer, voxel_size)
@@ -205,6 +264,11 @@ def process_worker_result(
         _add_segmentation_layers(
             cells, viewer, data_layer, voxel_size, seg_super_voxel
         )
+
+    if add_seg_layers_from_h5:
+        if segmentation_path is None:
+            raise ValueError("h5 file not provided")
+        _add_seg_layers_from_h5(cells, viewer, data_layer, segmentation_path)
 
 
 def get_heavy_widgets(
@@ -333,6 +397,7 @@ def analyse_widget() -> widgets.Container:
         debug_data: bool = False,
         add_sphere_layers: bool = False,
         add_segmentation_layers: bool = False,
+        add_seg_layers_from_h5: bool = False,
     ) -> None:
         """
         Run analysis.
@@ -413,6 +478,8 @@ def analyse_widget() -> widgets.Container:
                 add_segmentation_layers=add_segmentation_layers,
                 voxel_size=voxel_size,
                 seg_super_voxel=seg_super_voxel,
+                add_seg_layers_from_h5=add_seg_layers_from_h5,
+                segmentation_path=segmentation_path,
             )
         )
 
@@ -424,7 +491,7 @@ def analyse_widget() -> widgets.Container:
         ("Signal image", "Cell layer"),
         ("voxel_size", "voxel_size"),
     )
-    widget.insert(widget.index("add_segmentation_layers") + 1, progress_bar)
+    widget.insert(widget.index("add_seg_layers_from_h5") + 1, progress_bar)
 
     container = widgets.Container(
         widgets=[widget],
