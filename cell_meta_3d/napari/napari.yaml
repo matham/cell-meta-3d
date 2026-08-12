@@ -4,6 +4,11 @@ contributions:
     - id: cell-meta-3d.napari.widget.analyse_widget
       python_name: cell_meta_3d.napari.widget:analyse_widget
       title: Analyse cell metadata
+    - id: cell-meta-3d.napari.filter_widget.filter_widget
+      python_name: cell_meta_3d.napari.filter_widget:filter_widget
+      title: Filter via cell metadata
   widgets:
     - command: cell-meta-3d.napari.widget.analyse_widget
       display_name: Analyse cell metadata
+    - command: cell-meta-3d.napari.filter_widget.filter_widget
+      display_name: Filter via cell metadata

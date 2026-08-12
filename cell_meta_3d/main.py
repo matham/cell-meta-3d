@@ -499,6 +499,11 @@ def _run_batches(
             ]
             data_slice_corner_um.append(slice_corner_um)
 
+            item_s = sliced_upsampled_start_non_zeros[i]
+            item_e = item_s + sliced_upsampled_n_non_zeros[i]
+            intensity_values = sliced_upsampled_flat_data[item_s:item_e]
+            total_intensity = np.sum(intensity_values, dtype=np.float64).item()
+
             cell.z, cell.y, cell.x = [
                 int(round((cr + cn) / vx))
                 for cr, cn, vx in zip(
@@ -526,6 +531,7 @@ def _run_batches(
                     "r_z_um_max_std": -1,
                     "seg_id": total_cells,
                     "paor_volume_um3": volume[i],
+                    "paor_intensity_total": total_intensity,
                     "paor_xyz_um": paor_vectors_intensity[i],
                     "paor_shape_xyz_um": paor_vectors_mask[i],
                     "paor_centroid_xyz_um": [
@@ -551,32 +557,29 @@ def _run_batches(
             total_cells += 1
 
             if add_segmentation_to_metadata:
-                volume = np.zeros(
+                volume_intensity = np.zeros(
                     sliced_upsampled_shape[i],
                     dtype=sliced_upsampled_flat_data.dtype,
                 )
                 mask = np.zeros(sliced_upsampled_shape[i], dtype=bool)
 
-                item_s = sliced_upsampled_start_non_zeros[i]
-                item_e = item_s + sliced_upsampled_n_non_zeros[i]
                 non_zeros_idx = sliced_seg_mask_upsampled_flat_idx[
                     item_s:item_e, 1:
                 ]
-                values = sliced_upsampled_flat_data[item_s:item_e]
 
                 mask[
                     non_zeros_idx[:, 0],
                     non_zeros_idx[:, 1],
                     non_zeros_idx[:, 2],
                 ] = True
-                volume[
+                volume_intensity[
                     non_zeros_idx[:, 0],
                     non_zeros_idx[:, 1],
                     non_zeros_idx[:, 2],
-                ] = values
+                ] = intensity_values
                 cell.metadata["segmentation_upsampled"] = {
                     "mask": mask,
-                    "intensity": volume,
+                    "intensity": volume_intensity,
                     "corner_um": slice_corner_um,
                     "upsampled_voxel_size": up_vox_size,
                 }

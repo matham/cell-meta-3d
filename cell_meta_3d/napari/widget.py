@@ -88,24 +88,71 @@ class Worker(WorkerBase):
         return cells
 
 
+def _add_vol_from_multi_masks(
+    viewer: napari.Viewer,
+    masks: list[
+        tuple[
+            tuple[int, int, int], tuple[int, int, int], np.ndarray, np.ndarray
+        ]
+    ],
+    scale: tuple[float, float, float],
+    name: str,
+):
+    has_intensity = masks[0][3] is not None
+    starts = np.array([corner for corner, size, _, _ in masks])
+    sizes = np.array([size for corner, size, _, _ in masks])
+    ends = starts + sizes
+    min_start = starts.min(axis=0)
+    max_ends = ends.max(axis=0)
+    extents = max_ends - min_start
+
+    if has_intensity:
+        volume = np.zeros(extents, dtype=masks[0][3].dtype)
+    else:
+        volume = np.zeros((*extents, 4))
+    for i, (_, _, mask, intensity) in enumerate(masks):
+        sz, sy, sx = starts[i] - min_start
+        ez, ey, ex = ends[i] - min_start
+        if has_intensity:
+            volume[sz:ez, sy:ey, sx:ex][mask] = intensity
+        else:
+            volume[sz:ez, sy:ey, sx:ex, :][mask, :] = 1
+
+    z, y, x = min_start
+    viewer.add_image(
+        volume,
+        name=name,
+        scale=scale,
+        translate=(z * scale[0], y * scale[1], x * scale[2]),
+        rgb=not has_intensity,
+    )
+
+
 def _add_sphere_layers(
     cells: list[Cell],
     viewer: napari.Viewer,
     data_layer: napari.layers.Image,
     voxel_size: tuple[float, float, float],
 ):
+    if not cells:
+        return
+
     sz, sy, sx = data_layer.scale
-    s_lat = (sx + sy) / 2
+    s_lat = (voxel_size[1] + voxel_size[2]) / 2
+
+    masks = []
     for cell in cells:
         zyx = cell.metadata["center_xyz_um"][::-1]
-        z, y, x = [p / v for p, v in zip(zyx, voxel_size, strict=False)]
+        z, y, x = [
+            int(round(p / v)) for p, v in zip(zyx, voxel_size, strict=False)
+        ]
 
         r_xy = max(cell.metadata["r_xy_um"] / s_lat, 1)
         r_z = max(cell.metadata["r_z_um"] / sz, 1)
         size_xy = max(int(round(2 * cell.metadata["r_xy_um"] / s_lat)), 1) + 2
         size_z = max(int(round(2 * cell.metadata["r_z_um"] / sz)), 1) + 2
-        c_xy = size_xy / 2
-        c_z = size_z / 2
+        c_xy = int(round(size_xy / 2))
+        c_z = int(round(size_z / 2))
 
         zg, yg, xg = np.mgrid[0:size_z:1, 0:size_xy:1, 0:size_xy:1]
         r = np.sqrt(
@@ -113,16 +160,9 @@ def _add_sphere_layers(
             + ((yg - c_xy) / r_xy) ** 2
             + ((xg - c_xy) / r_xy) ** 2
         )
-        sphere = np.zeros((*r.shape, 4))
-        sphere[r <= 1, :] = 1
+        masks.append(((z - c_z, y - c_xy, x - c_xy), r.shape, r <= 1, None))
 
-        viewer.add_image(
-            sphere,
-            name=f"{z}z{y}y{x}x sphere",
-            scale=[sz, sy, sx],
-            translate=((z - c_z) * sz, (y - c_xy) * sy, (x - c_xy) * sx),
-            rgb=True,
-        )
+    _add_vol_from_multi_masks(viewer, masks, (sz, sy, sx), "Spheres")
 
 
 def _add_segmentation_layers(
@@ -132,27 +172,23 @@ def _add_segmentation_layers(
     voxel_size: tuple[float, float, float],
     seg_super_voxel: tuple[int, int, int],
 ):
+    if not cells:
+        return
+
     sz, sy, sx = data_layer.scale
+
+    lines = {"shape": [], "intensity": []}
+    masks = []
     for cell in cells:
         seg_data = cell.metadata["segmentation_upsampled"]
-        mask = seg_data["mask"][:, :, :, None]
-        mask = np.repeat(mask, 4, axis=3)
-        zcn, ycn, xcn = (
-            c / s
-            for c, s in zip(seg_data["corner_um"], voxel_size, strict=True)
-        )
-
-        viewer.add_image(
-            mask,
-            name="segmentation",
-            scale=(
-                sz / seg_super_voxel[0],
-                sy / seg_super_voxel[1],
-                sx / seg_super_voxel[2],
-            ),
-            translate=(zcn * sz, ycn * sy, xcn * sx),
-            rgb=True,
-        )
+        mask = seg_data["mask"]
+        corner = [
+            int(round(c / s * sv))
+            for c, s, sv in zip(
+                seg_data["corner_um"], voxel_size, seg_super_voxel, strict=True
+            )
+        ]
+        masks.append((corner, mask.shape, mask, None))
 
         for tp, name in (("", "intensity"), ("_shape", "shape")):
             # convert all to zyx
@@ -170,24 +206,38 @@ def _add_segmentation_layers(
 
             # vectors_vox * extent_um is vectors_um * extent_um / voxel_size,
             # which is extent_vector_vox
-            lines = [
-                np.array(
-                    [
-                        centroid_vox + vectors_vox[ax, :] * extent_um[ax, 0],
-                        centroid_vox + vectors_vox[ax, :] * extent_um[ax, 1],
-                    ]
+            for ax in range(3):
+                lines[name].append(
+                    np.array(
+                        [
+                            centroid_vox
+                            + vectors_vox[ax, :] * extent_um[ax, 0],
+                            centroid_vox
+                            + vectors_vox[ax, :] * extent_um[ax, 1],
+                        ]
+                    )
                 )
-                for ax in range(3)
-            ]
 
-            viewer.add_shapes(
-                lines,
-                name=f"PAOR {name}",
-                shape_type="line",
-                edge_color=["red", "green", "blue"],
-                scale=(sz, sy, sx),
-                edge_width=0.25,
-            )
+    _add_vol_from_multi_masks(
+        viewer,
+        masks,
+        (
+            sz / seg_super_voxel[0],
+            sy / seg_super_voxel[1],
+            sx / seg_super_voxel[2],
+        ),
+        "Segmentation",
+    )
+
+    for name, values in lines.items():
+        viewer.add_shapes(
+            values,
+            name=f"PAOR {name}",
+            shape_type="line",
+            edge_color=["red", "green", "blue"] * len(cells),
+            scale=(sz, sy, sx),
+            edge_width=0.2,
+        )
 
 
 def _add_seg_layers_from_h5(
@@ -196,6 +246,8 @@ def _add_seg_layers_from_h5(
     data_layer: napari.layers.Image,
     segmentation_path: Path,
 ):
+    sz, sy, sx = data_layer.scale
+    masks = []
     with h5py.File(segmentation_path, "r") as h5_file:
         super_voxel = tuple(v.item() for v in h5_file.attrs["super_voxel"])
         intensity_index_dset: h5py.Dataset = h5_file[
@@ -210,40 +262,35 @@ def _add_seg_layers_from_h5(
             data_index = cell.metadata["seg_id"]
 
             intensity_s, intensity_e = cell_index_range_dset[data_index, :]
-            corner = cell_corner_dset[data_index, :]
+            corner_up = [
+                int(round(v))
+                for v in cell_corner_dset[data_index, :] * super_voxel
+            ]
             intensity_index = np.asarray(
                 intensity_index_dset[intensity_s:intensity_e, :], dtype=np.intp
             )
             intensity = np.asarray(intensity_dset[intensity_s:intensity_e])
             cuboid_voxels = cuboid_voxels_dset[data_index, :]
 
-            volume = np.zeros(cuboid_voxels, dtype=intensity.dtype)
+            volume = np.zeros(cuboid_voxels, dtype=bool)
             volume[
                 intensity_index[:, 0],
                 intensity_index[:, 1],
                 intensity_index[:, 2],
-            ] = intensity
+            ] = True
 
-            seg_data = cell.metadata["segmentation_upsampled"]
-            mask = seg_data["mask"][:, :, :, None]
-            mask = np.repeat(mask, 4, axis=3)
+            masks.append((corner_up, volume.shape, volume, intensity))
 
-            offset = [
-                c * s for c, s in zip(corner, data_layer.scale, strict=True)
-            ]
-
-            viewer.add_image(
-                mask,
-                name="h5 segmentation",
-                scale=[
-                    s / sv
-                    for s, sv in zip(
-                        data_layer.scale, super_voxel, strict=False
-                    )
-                ],
-                translate=offset,
-                rgb=True,
-            )
+    _add_vol_from_multi_masks(
+        viewer,
+        masks,
+        (
+            sz / super_voxel[0],
+            sy / super_voxel[1],
+            sx / super_voxel[2],
+        ),
+        "h5 segmentation",
+    )
 
 
 def process_worker_result(
@@ -356,8 +403,9 @@ def analyse_widget() -> widgets.Container:
     signal_image_opt, cell_layer_opt = get_heavy_widgets(options)
 
     @magicgui(
-        lateral_decay_fraction={"max": 1, "step": 0.0001},
-        axial_decay_fraction={"max": 1, "step": 0.0001},
+        lateral_decay_fraction={"min": 0, "max": 1, "step": 0.0001},
+        axial_decay_fraction={"min": 0, "max": 1, "step": 0.0001},
+        seg_decay_fraction={"min": 0, "max": 1, "step": 0.0001},
         plot_output_path={"mode": "d"},
         output_cells_path={"mode": "w"},
         segmentation_path={"mode": "w"},
@@ -499,6 +547,12 @@ def analyse_widget() -> widgets.Container:
         labels=False,
         scrollable=True,
     )
+
+    viewer: napari.Viewer = napari.current_viewer()
+    for w in (signal_image_opt, cell_layer_opt):
+        viewer.layers.events.inserted.connect(w.reset_choices)
+        viewer.layers.events.removed.connect(w.reset_choices)
+        viewer.layers.events.renamed.connect(w.reset_choices)
 
     # needed for enabling scrolling
     return container.root_native_widget
