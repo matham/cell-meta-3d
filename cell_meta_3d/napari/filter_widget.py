@@ -18,6 +18,22 @@ class FilterWidget:
         self._layer_widgets = []
         self.show_hist_widget = None
 
+    def _get_metadata_value(self, cells: Points, measure: str) -> np.ndarray:
+        if measure == "paor_cuboid_um3":
+            extent = np.array([v for v in cells.features["paor_extent_um"]])
+            extent = -extent[:, :, 0] + extent[:, :, 1]
+            data = extent[:, 0] * extent[:, 1] * extent[:, 2]
+        elif measure == "paor_cuboid_shape_um3":
+            extent = np.array(
+                [v for v in cells.features["paor_extent_shape_um"]]
+            )
+            extent = -extent[:, :, 0] + extent[:, :, 1]
+            data = extent[:, 0] * extent[:, 1] * extent[:, 2]
+        else:
+            data = np.array([v for v in cells.features[measure]])
+
+        return data
+
     def _calculate_measure(
         self,
         available_cells: Points,
@@ -27,14 +43,15 @@ class FilterWidget:
         indexing2: list[int],
         measure2_op: Literal["divide", "multiply"] = "divide",
         x_log_scale: bool = False,
-        x_log_min: float = 1e-5,
+        restrict_range: bool = False,
+        x_range: tuple[float, float] = (1e-5, 1e5),
     ) -> np.ndarray:
-        data = np.array([v for v in available_cells.features[measure]])
+        data = self._get_metadata_value(available_cells, measure)
         for i in indexing:
             data = data[:, i]
 
         if measure2:
-            data2 = np.array([v for v in available_cells.features[measure2]])
+            data2 = self._get_metadata_value(available_cells, measure2)
             for i in indexing2:
                 data2 = data2[:, i]
 
@@ -47,11 +64,20 @@ class FilterWidget:
             else:
                 raise ValueError
 
-        data = np.maximum(data, x_log_min)
-        if x_log_scale:
-            data = np.log10(data)
+        if restrict_range:
+            mask = np.logical_and(x_range[0] <= data, data <= x_range[1])
+            masked_data = np.zeros_like(data)
+            if x_log_scale:
+                masked_data[mask] = np.log10(data[mask])
+            else:
+                masked_data[mask] = data[mask]
+        else:
+            if x_log_scale:
+                masked_data = np.log10(data)
+            else:
+                masked_data = data
 
-        return data
+        return masked_data
 
     def show_hist(
         self,
@@ -61,8 +87,9 @@ class FilterWidget:
         measure2: Literal[None],
         indexing2: list[int],
         measure2_op: Literal["divide", "multiply"] = "divide",
+        restrict_range: bool = False,
+        x_range: tuple[float, float] = (1e-5, 1e5),
         x_log_scale: bool = False,
-        x_log_min: float = 1e-5,
         y_log_scale: bool = False,
         num_bins: int = 100,
     ) -> None:
@@ -79,7 +106,8 @@ class FilterWidget:
             indexing2,
             measure2_op,
             x_log_scale,
-            x_log_min,
+            restrict_range,
+            x_range,
         )
 
         plt.hist(data, bins=num_bins, log=y_log_scale)
@@ -105,7 +133,8 @@ class FilterWidget:
             w.indexing2.value,
             w.measure2_op.value,
             w.x_log_scale.value,
-            w.x_log_min.value,
+            w.restrict_range.value,
+            w.x_range.value,
         )
 
         if application == "filter":
@@ -191,6 +220,7 @@ class FilterWidget:
     def _update_layer_widgets_new_layers(self, *args):
         for widget in self._layer_widgets:
             widget.reset_choices()
+        self._update_measure_choices()
 
     def _update_measure_choices(self, *args):
         cells = self.show_hist_widget.available_cells
@@ -198,8 +228,14 @@ class FilterWidget:
             return
 
         names = cells.value.features.columns
-        self.show_hist_widget.measure.choices = list(names)
-        self.show_hist_widget.measure2.choices = list(names)
+        self.show_hist_widget.measure.choices = list(names) + [
+            "paor_cuboid_um3",
+            "paor_cuboid_shape_um3",
+        ]
+        self.show_hist_widget.measure2.choices = list(names) + [
+            "paor_cuboid_um3",
+            "paor_cuboid_shape_um3",
+        ]
 
     def build(self) -> widgets.Container:
         show_hist_widget = FunctionGui(
@@ -212,7 +248,9 @@ class FilterWidget:
                 "indexing": {"options": {"min": 0}},
                 "measure2": {"nullable": True},
                 "indexing2": {"options": {"min": 0}},
-                "x_log_min": {"step": 1e-5},
+                "x_range": {
+                    "options": {"step": 1e-5, "max": 100_000, "min": -100_000}
+                },
                 "num_bins": {"min": 2},
             },
         )
@@ -223,7 +261,7 @@ class FilterWidget:
             auto_call=False,
             persist=True,
             param_options={
-                "cutoff": {"step": 1e-4, "max": 100_000},
+                "cutoff": {"step": 1e-4, "max": 100_000, "min": -100_000},
             },
         )
         show_seg_widget = FunctionGui(
@@ -259,6 +297,7 @@ class FilterWidget:
         viewer.layers.events.inserted.connect(layers_update)
         viewer.layers.events.removed.connect(layers_update)
         viewer.layers.events.renamed.connect(layers_update)
+        layers_update()
 
         # needed for enabling scrolling
         return container.root_native_widget
