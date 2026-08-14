@@ -22,6 +22,7 @@ class FilterWidget:
     def __init__(self):
         self._layer_widgets = []
         self.show_hist_widget = None
+        self.apply_filter_widget = None
 
     def _get_metadata_value(self, cells: Points, measure: str) -> np.ndarray:
         if measure == "paor_cuboid_um3":
@@ -110,12 +111,14 @@ class FilterWidget:
         hist: np.ndarray,
     ) -> tuple[float, float, float, float, float]:
         max_hist_i = np.argmax(hist)
-        max_c_n = np.sum(center <= center[max_hist_i])
+        end = max_hist_i + np.argmax(
+            hist[max_hist_i:] < hist[max_hist_i] * 0.95
+        )
         (a, offset, sigma, c), pcov = curve_fit(
             gaussian_func,
-            center[:max_c_n],
-            hist[:max_c_n],
-            p0=[hist[max_hist_i], center[max_hist_i], 1, 0],
+            center[:end],
+            hist[:end],
+            p0=[hist[max_hist_i], center[max_hist_i], 0.1, 0],
         )
         perr = np.sqrt(np.diag(pcov))
 
@@ -170,9 +173,44 @@ class FilterWidget:
             plt.plot(center, pred, label="Gaussian")
             plt.plot(center, hist - pred, label="Residual")
 
+        w = self.apply_filter_widget
+        cutoff = self._get_cutoff(
+            data,
+            w.gaussian_cutoff.value,
+            w.cutoff.value,
+            w.residual_mean.value,
+            w.residual_percentile.value,
+        )
+        print(f"filter cutoff is {cutoff}")
+        plt.plot([cutoff], [0], "*", label="Cutoff")
+
         plt.legend()
         plt.tight_layout()
         plt.show()
+
+    def _get_cutoff(
+        self,
+        data: np.ndarray,
+        gaussian_cutoff: bool,
+        cutoff: float,
+        residual_mean: bool,
+        residual_percentile: float,
+    ) -> float:
+        if gaussian_cutoff:
+            center, hist = self._get_histogram(
+                data, self.show_hist_widget.y_log_scale.value
+            )
+            a, offset, sigma, c, perr = self._get_gaussian_params(center, hist)
+            cutoff = offset + cutoff * sigma
+
+            if residual_mean:
+                cutoff = np.mean(data[data > cutoff])
+            elif residual_percentile > 0:
+                cutoff = np.percentile(
+                    data[data > cutoff], residual_percentile
+                )
+
+        return cutoff
 
     def apply_filter(
         self,
@@ -215,22 +253,13 @@ class FilterWidget:
         )
 
         if application == "filter":
-            if gaussian_cutoff:
-                center, hist = self._get_histogram(
-                    data_full, w.y_log_scale.value
-                )
-                a, offset, sigma, c, perr = self._get_gaussian_params(
-                    center, hist
-                )
-                cutoff = offset + cutoff * sigma
-
-                if residual_mean:
-                    cutoff = np.mean(data_full[data_full > cutoff])
-                elif residual_percentile > 0:
-                    cutoff = np.percentile(
-                        data_full[data_full > cutoff], residual_percentile
-                    )
-            print(f"filter cutoff is {cutoff}")
+            cutoff = self._get_cutoff(
+                data_full,
+                gaussian_cutoff,
+                cutoff,
+                residual_mean,
+                residual_percentile,
+            )
 
             if keep_above:
                 mask = data >= cutoff
@@ -320,7 +349,7 @@ class FilterWidget:
 
     def _update_measure_choices(self, *args):
         cells = self.show_hist_widget.available_cells
-        if cells is None:
+        if not cells.value:
             return
 
         names = cells.value.features.columns
@@ -359,6 +388,7 @@ class FilterWidget:
                 "cutoff": {"step": 1e-4, "max": 100_000, "min": -100_000},
             },
         )
+        self.apply_filter_widget = apply_filter_widget
         show_seg_widget = FunctionGui(
             self.show_segmentation,
             call_button="Show segmentation",
