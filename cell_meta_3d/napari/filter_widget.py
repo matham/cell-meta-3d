@@ -8,8 +8,13 @@ import numpy as np
 from magicgui import widgets
 from magicgui.widgets import FunctionGui
 from napari.layers import Points
+from scipy.optimize import curve_fit
 
 from cell_meta_3d.napari.widget import _add_vol_from_multi_masks
+
+
+def gaussian_func(x, a, offset, sigma, c):
+    return a * np.exp(-np.square(x - offset) / (2 * sigma**2)) + c
 
 
 class FilterWidget:
@@ -79,6 +84,43 @@ class FilterWidget:
 
         return masked_data
 
+    def _get_histogram(
+        self,
+        data: np.ndarray,
+        y_log_scale: bool,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        hist, edges = np.histogram(data, bins="auto")
+        center = (edges[1:] - edges[:-1]) / 2 + edges[:-1]
+
+        if y_log_scale:
+            min_val = np.min(hist)
+            if np.isclose(min_val, 0):
+                hist = (
+                    hist
+                    + hist[np.logical_not(np.isclose(hist, 0))].min() / 100
+                )
+
+            hist = np.log10(hist)
+
+        return center, hist
+
+    def _get_gaussian_params(
+        self,
+        center: np.ndarray,
+        hist: np.ndarray,
+    ) -> tuple[float, float, float, float, float]:
+        max_hist_i = np.argmax(hist)
+        max_c_n = np.sum(center <= center[max_hist_i])
+        (a, offset, sigma, c), pcov = curve_fit(
+            gaussian_func,
+            center[:max_c_n],
+            hist[:max_c_n],
+            p0=[hist[max_hist_i], center[max_hist_i], 1, 0],
+        )
+        perr = np.sqrt(np.diag(pcov))
+
+        return a, offset, np.abs(sigma), c, perr
+
     def show_hist(
         self,
         available_cells: Points,
@@ -91,7 +133,7 @@ class FilterWidget:
         x_range: tuple[float, float] = (1e-5, 1e5),
         x_log_scale: bool = False,
         y_log_scale: bool = False,
-        num_bins: int = 100,
+        fit_gaussian: bool = False,
     ) -> None:
         if not available_cells:
             raise ValueError("Cells must be provided")
@@ -110,21 +152,45 @@ class FilterWidget:
             x_range,
         )
 
-        plt.hist(data, bins=num_bins, log=y_log_scale)
+        center, hist = self._get_histogram(data, y_log_scale)
+        plt.plot(center, hist, label="histogram")
+
+        if fit_gaussian:
+            a, offset, sigma, c, perr = self._get_gaussian_params(center, hist)
+            print(
+                "Got values of a, offset, sigma, c, perr:",
+                a,
+                offset,
+                sigma,
+                c,
+                perr,
+            )
+
+            pred = gaussian_func(center, a, offset, sigma, c)
+            plt.plot(center, pred, label="Gaussian")
+            plt.plot(center, hist - pred, label="Residual")
+
+        plt.legend()
+        plt.tight_layout()
         plt.show()
 
     def apply_filter(
         self,
         displayed_cells: Points,
+        gaussian_cutoff: bool = False,
         cutoff: float = 0.0,
+        residual_mean: bool = False,
+        residual_percentile: float = 0,
         keep_above: bool = True,
         reset_visible: bool = True,
         application: Literal["filter", "color"] = "filter",
     ):
+        w = self.show_hist_widget
         if not displayed_cells:
             raise ValueError("Cells must be provided")
+        if not w.available_cells.value:
+            raise ValueError("Cells must be provided")
 
-        w = self.show_hist_widget
         data = self._calculate_measure(
             displayed_cells,
             w.measure.value,
@@ -136,8 +202,36 @@ class FilterWidget:
             w.restrict_range.value,
             w.x_range.value,
         )
+        data_full = self._calculate_measure(
+            w.available_cells.value,
+            w.measure.value,
+            w.indexing.value,
+            w.measure2.value,
+            w.indexing2.value,
+            w.measure2_op.value,
+            w.x_log_scale.value,
+            w.restrict_range.value,
+            w.x_range.value,
+        )
 
         if application == "filter":
+            if gaussian_cutoff:
+                center, hist = self._get_histogram(
+                    data_full, w.y_log_scale.value
+                )
+                a, offset, sigma, c, perr = self._get_gaussian_params(
+                    center, hist
+                )
+                cutoff = offset + cutoff * sigma
+
+                if residual_mean:
+                    cutoff = np.mean(data_full[data_full > cutoff])
+                elif residual_percentile > 0:
+                    cutoff = np.percentile(
+                        data_full[data_full > cutoff], residual_percentile
+                    )
+            print(f"filter cutoff is {cutoff}")
+
             if keep_above:
                 mask = data >= cutoff
             else:
@@ -151,8 +245,10 @@ class FilterWidget:
                 )
         else:
             displayed_cells.shown = True
-            data -= data.min()
-            data /= data.max()
+            min_val = min(data_full.min(), data.min())
+            data -= min_val
+            data_full -= min_val
+            data /= max(data_full.max(), data.max())
             displayed_cells.face_color = plt.cm.plasma(data)
 
     def show_segmentation(
@@ -251,7 +347,6 @@ class FilterWidget:
                 "x_range": {
                     "options": {"step": 1e-5, "max": 100_000, "min": -100_000}
                 },
-                "num_bins": {"min": 2},
             },
         )
         self.show_hist_widget = show_hist_widget
