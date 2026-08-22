@@ -45,9 +45,12 @@ class FilterWidget:
         available_cells: Points,
         measure: Literal[""],
         indexing: list[int],
-        measure2: Literal[None],
-        indexing2: list[int],
+        measure2: Literal[None] = None,
+        indexing2: list[int] = (),
         measure2_op: Literal["divide", "multiply"] = "divide",
+        measure3: Literal[None] = None,
+        indexing3: list[int] = (),
+        measure3_op: Literal["divide", "multiply"] = "multiply",
         x_log_scale: bool = False,
         restrict_range: bool = False,
         x_range: tuple[float, float] = (1e-5, 1e5),
@@ -67,6 +70,20 @@ class FilterWidget:
                 )
             elif measure2_op == "multiply":
                 data = data * data2
+            else:
+                raise ValueError
+
+        if measure3:
+            data3 = self._get_metadata_value(available_cells, measure3)
+            for i in indexing3:
+                data3 = data3[:, i]
+
+            if measure3_op == "divide":
+                data = np.divide(
+                    data, data3, out=np.zeros_like(data3), where=data3 != 0
+                )
+            elif measure3_op == "multiply":
+                data = data * data3
             else:
                 raise ValueError
 
@@ -129,9 +146,12 @@ class FilterWidget:
         available_cells: Points,
         measure: Literal[""],
         indexing: list[int],
-        measure2: Literal[None],
-        indexing2: list[int],
+        measure2: Literal[None] = None,
+        indexing2: list[int] = (),
         measure2_op: Literal["divide", "multiply"] = "divide",
+        measure3: Literal[None] = None,
+        indexing3: list[int] = (),
+        measure3_op: Literal["divide", "multiply"] = "multiply",
         restrict_range: bool = False,
         x_range: tuple[float, float] = (1e-5, 1e5),
         x_log_scale: bool = False,
@@ -150,6 +170,9 @@ class FilterWidget:
             measure2,
             indexing2,
             measure2_op,
+            measure3,
+            indexing3,
+            measure3_op,
             x_log_scale,
             restrict_range,
             x_range,
@@ -236,6 +259,9 @@ class FilterWidget:
             w.measure2.value,
             w.indexing2.value,
             w.measure2_op.value,
+            w.measure3.value,
+            w.indexing3.value,
+            w.measure3_op.value,
             w.x_log_scale.value,
             w.restrict_range.value,
             w.x_range.value,
@@ -247,6 +273,9 @@ class FilterWidget:
             w.measure2.value,
             w.indexing2.value,
             w.measure2_op.value,
+            w.measure3.value,
+            w.indexing3.value,
+            w.measure3_op.value,
             w.x_log_scale.value,
             w.restrict_range.value,
             w.x_range.value,
@@ -361,6 +390,10 @@ class FilterWidget:
             "paor_cuboid_um3",
             "paor_cuboid_shape_um3",
         ]
+        self.show_hist_widget.measure3.choices = list(names) + [
+            "paor_cuboid_um3",
+            "paor_cuboid_shape_um3",
+        ]
 
     def build(self) -> widgets.Container:
         show_hist_widget = FunctionGui(
@@ -373,6 +406,8 @@ class FilterWidget:
                 "indexing": {"options": {"min": 0}},
                 "measure2": {"nullable": True},
                 "indexing2": {"options": {"min": 0}},
+                "measure3": {"nullable": True},
+                "indexing3": {"options": {"min": 0}},
                 "x_range": {
                     "options": {"step": 1e-5, "max": 100_000, "min": -100_000}
                 },

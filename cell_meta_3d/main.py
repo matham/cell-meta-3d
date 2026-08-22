@@ -460,7 +460,7 @@ def _run_batches(
         ) = [item.numpy() for item in batch]
         center = np.round(center).astype(int)
         indices = indices.numpy().astype(int)
-        sliced_upsampled_start_non_zeros = np.cumulative_sum(
+        sliced_upsampled_start_non_zeros = np.cumsum(
             sliced_upsampled_n_non_zeros
         )
         sliced_upsampled_start_non_zeros -= sliced_upsampled_n_non_zeros
